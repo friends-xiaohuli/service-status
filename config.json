@@ -1,0 +1,69 @@
+{
+  "port": "8080",
+  "https_port": "443",
+  "service_groups": [
+    {
+      "name": "主要站点",
+      "services": [
+        {
+          "name": "小狐狸的使用手册",
+          "type": "http",
+          "url": "https://www.0201799.xyz/assets/logo/logo.png",
+          "timeout": 5
+        },
+        {
+          "name": "源石技艺 WIKI",
+          "subtitle": "OriginiumArts",
+          "type": "http",
+          "url": "https://originiumarts.0201799.xyz/",
+          "timeout": 5
+        },
+        {
+          "name": "二重螺旋服务站点",
+          "subtitle": "DNA咕噜咕噜",
+          "type": "http",
+          "url": "https://dna.0201799.xyz/",
+          "timeout": 5
+        },
+        {
+          "name": "二重螺旋翻译API",
+          "type": "http",
+          "url": "https://dnai18napi.0201799.xyz/",
+          "timeout": 5
+        }
+      ]
+    },
+    {
+      "name": "基础库",
+      "services": [
+        {
+          "name": "PDSRZ SQL",
+          "type": "mysql",
+          "host": "23.179.248.238",
+          "port": 3366,
+          "timeout": 5
+        }
+      ]
+    },
+    {
+      "name": "测试分组",
+      "services": [
+        {
+          "name": "测试服务器",
+          "type": "ping",
+          "host": "101.43.43.100",
+          "port": 3366,
+          "timeout": 5
+        },
+        {
+          "name": "NCQQ服务",
+          "type": "napcat_qq",
+          "host": "101.43.43.100",
+          "port": 6099,
+          "timeout": 5
+        }
+
+      ]
+    }
+  ]
+}
