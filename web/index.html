@@ -249,6 +249,7 @@
       display: flex;
       flex-direction: column;
       gap: 8px;
+      position: relative;
     }
 
     .card {
@@ -262,8 +263,12 @@
       align-items: center;
       gap: 16px;
       transition: border-color .2s;
+      overflow: visible;
+      z-index: 0;
     }
     .card:hover { border-color: rgba(249,115,22,.25); }
+    .card:hover,
+    .card:focus-within { z-index: 12; }
 
     .card::before {
       content: '';
@@ -338,16 +343,8 @@
     .warn   { color: var(--yellow); }
     .bad    { color: var(--red); }
 
-    /* 人数条 */
-    .player-bar { margin-top:7px; }
-    .player-bar-header { display:flex; justify-content:space-between; font-size:10px; color:var(--muted); margin-bottom:3px; }
-    .player-bar-header b { color:var(--text); }
-    .player-track { height:3px; background:var(--s2); border-radius:3px; overflow:hidden; }
-    .player-fill  { height:100%; border-radius:3px; background:linear-gradient(90deg,var(--accent),var(--accent2)); transition:width .6s; }
-    .player-fill.full { background:linear-gradient(90deg,var(--yellow),var(--red)); }
-
     /* 第三列：历史 */
-    .history-col { min-width:0; }
+    .history-col { min-width:0; position:relative; z-index:1; }
     .history-top {
       display:flex; justify-content:space-between; align-items:center;
       margin-bottom:6px;
@@ -360,7 +357,10 @@
       cursor:default; position:relative; transition:opacity .15s; min-width:2px;
     }
     .hb:hover { opacity:.65; }
+    .hb:hover,
+    .hb:focus-visible { z-index:2; }
     .hb.empty { background:rgba(255,255,255,.04); }
+    .hb.empty::after { content:none; display:none; }
     .hb::after {
       content: attr(data-tip);
       position:absolute; bottom:calc(100% + 6px); left:50%; transform:translateX(-50%);
@@ -521,20 +521,60 @@
 
   const typeLabels = {
     http: 'HTTP', tcp: 'TCP', ping: 'PING', mysql: 'MySQL', napcat_qq: 'NapCat QQ',
-    minecraft_bedrock: 'Minecraft Bedrock',
-    minecraft_java: 'Minecraft Java',
   };
 
-  function speedClass(ms) {
-    if (!ms || ms <= 0) return '';
-    if (ms < 100) return 'fast';
-    if (ms < 500) return 'medium';
-    return 'slow';
-  }
   function uptimeClass(p) {
     if (p >= 95) return 'good';
     if (p >= 80) return 'warn';
     return 'bad';
+  }
+
+  const METRIC_STOPS = {
+    online: [
+      [   0,  34, 197,  94 ],
+      [ 300,  74, 185,  84 ],
+      [ 700, 245, 158,  11 ],
+      [1200, 245, 140,   8 ],
+    ],
+    unknown: [
+      [   0, 245, 158,  11 ],
+      [ 260, 249, 115,  22 ],
+      [1200, 234,  88,  12 ],
+    ],
+    offline: [
+      [   0, 249, 115,  22 ],
+      [ 260, 245, 140,   8 ],
+      [1200, 234,  88,  12 ],
+    ],
+  };
+
+  function lerpMetricColor(stops, ms) {
+    if (ms <= stops[0][0]) {
+      const [, r, g, b] = stops[0];
+      return `rgb(${r},${g},${b})`;
+    }
+    const last = stops[stops.length - 1];
+    if (ms >= last[0]) {
+      const [, r, g, b] = last;
+      return `rgb(${r},${g},${b})`;
+    }
+    for (let i = 1; i < stops.length; i++) {
+      if (ms <= stops[i][0]) {
+        const [ms0, r0, g0, b0] = stops[i - 1];
+        const [ms1, r1, g1, b1] = stops[i];
+        const t = (ms - ms0) / (ms1 - ms0);
+        const r = Math.round(r0 + (r1 - r0) * t);
+        const g = Math.round(g0 + (g1 - g0) * t);
+        const b = Math.round(b0 + (b1 - b0) * t);
+        return `rgb(${r},${g},${b})`;
+      }
+    }
+  }
+
+  function responseMetricStyle(status, ms) {
+    if (!ms || ms <= 0) return '';
+    const stops = METRIC_STOPS[status] || METRIC_STOPS.unknown;
+    return `color:${lerpMetricColor(stops, ms)}`;
   }
 
   function filterHistory(hist, rangeSec) {
@@ -551,34 +591,33 @@
     return hist.filter(h => h.status === 'online').length / hist.length * 100;
   }
 
-  // 按响应时间做多段线性插值，映射到颜色
-  // stops: [ms门槛, r, g, b, a]
-  const RT_STOPS = [
-    [   0,  34, 197,  94, 1.00],  // 极快   · 亮绿
-    [  50,  34, 197,  94, 0.90],  // 很快   · 绿
-    [ 100,  74, 185,  84, 0.85],  // 快      · 中绿
-    [ 160, 132, 204,  22, 0.85],  // 偏快   · 黄绿
-    [ 250, 234, 179,   8, 0.88],  // 一般   · 黄
-    [ 380, 245, 140,   8, 0.88],  // 偏慢   · 黄橙
-    [ 550, 249, 115,  22, 0.90],  // 慢      · 橙
-    [ 800, 239,  80,  40, 0.90],  // 很慢   · 橙红
-    [1200, 239,  68,  68, 0.92],  // 极慢   · 红
-  ];
+  const HISTORY_STOPS = {
+    online: [
+      [   0,  34, 197,  94, 0.95 ],
+      [ 300,  74, 185,  84, 0.92 ],
+      [ 700, 245, 158,  11, 0.90 ],
+      [1200, 245, 140,   8, 0.90 ],
+    ],
+    unknown: [
+      [   0, 249, 115,  22, 0.88 ],
+      [1200, 234,  88,  12, 0.92 ],
+    ],
+  };
 
-  function lerpColor(ms) {
-    if (ms <= RT_STOPS[0][0]) {
-      const [, r, g, b, a] = RT_STOPS[0];
+  function lerpHistoryColor(stops, ms) {
+    if (ms <= stops[0][0]) {
+      const [, r, g, b, a] = stops[0];
       return `rgba(${r},${g},${b},${a})`;
     }
-    const last = RT_STOPS[RT_STOPS.length - 1];
+    const last = stops[stops.length - 1];
     if (ms >= last[0]) {
       const [, r, g, b, a] = last;
       return `rgba(${r},${g},${b},${a})`;
     }
-    for (let i = 1; i < RT_STOPS.length; i++) {
-      if (ms <= RT_STOPS[i][0]) {
-        const [ms0, r0, g0, b0, a0] = RT_STOPS[i - 1];
-        const [ms1, r1, g1, b1, a1] = RT_STOPS[i];
+    for (let i = 1; i < stops.length; i++) {
+      if (ms <= stops[i][0]) {
+        const [ms0, r0, g0, b0, a0] = stops[i - 1];
+        const [ms1, r1, g1, b1, a1] = stops[i];
         const t = (ms - ms0) / (ms1 - ms0);
         const r = Math.round(r0 + (r1 - r0) * t);
         const g = Math.round(g0 + (g1 - g0) * t);
@@ -590,9 +629,9 @@
   }
 
   function histColor(h) {
-    if (h.status === 'offline') return 'rgba(239,68,68,0.85)';
-    if (h.status !== 'online')  return 'rgba(245,158,11,0.75)';
-    return lerpColor(h.response_time || 0);
+    if (h.status === 'offline') return 'rgba(239,68,68,0.88)';
+    if (h.status !== 'online')  return lerpHistoryColor(HISTORY_STOPS.unknown, h.response_time || 0);
+    return lerpHistoryColor(HISTORY_STOPS.online, h.response_time || 0);
   }
 
   function setRange(btn, key) {
@@ -642,21 +681,12 @@
     const uptimeTx   = filtUptime != null ? filtUptime.toFixed(1) + '%' : '--';
     const uptimeCls  = filtUptime != null ? uptimeClass(filtUptime) : '';
 
-    let playerHtml = '';
-    if (s.has_players && st === 'online') {
-      const pct = s.player_max > 0 ? Math.min(Math.round(s.player_online / s.player_max * 100), 100) : 0;
-      playerHtml = `
-        <div class="player-bar">
-          <div class="player-bar-header"><span>在线人数</span><span><b>${s.player_online}</b> / ${s.player_max}</span></div>
-          <div class="player-track"><div class="player-fill ${pct>=95?'full':''}" style="width:${pct}%"></div></div>
-        </div>`;
-    }
-
     const pad    = SLOTS - filtHist.length;
     const blocks = [
       ...Array(pad).fill('<div class="hb empty"></div>'),
       ...filtHist.map(h => {
-        const tip = `${h.time}  ${h.response_time > 0 ? h.response_time+'ms' : '--'}`;
+        const histStatusTx = { online:'在线', offline:'离线', unknown:'降级' }[h.status] || '未知';
+        const tip = `${histStatusTx} · ${h.time} · ${h.response_time > 0 ? h.response_time+'ms' : '--'}`;
         return `<div class="hb" style="background:${histColor(h)}" data-tip="${tip}"></div>`;
       })
     ].join('');
@@ -680,7 +710,7 @@
         <div>
           <div class="card-metrics">
             <div class="metric">
-              <div class="metric-val ${speedClass(rt)}">${rtTx}</div>
+              <div class="metric-val" style="${responseMetricStyle(st, rt)}">${rtTx}</div>
               <div class="metric-label">响应延迟</div>
             </div>
             <div class="metric">
@@ -688,7 +718,6 @@
               <div class="metric-label">可用率</div>
             </div>
           </div>
-          ${playerHtml}
         </div>
         <div class="history-col">
           <div class="history-top">
@@ -696,7 +725,7 @@
             <span class="history-pct ${uptimeCls}">${uptimeTx}</span>
             <span class="history-time">${t1||'最新'}</span>
           </div>
-          <div class="history-blocks">${blocks}</div>
+          <div class="history-blocks" style="--slots:${SLOTS}">${blocks}</div>
         </div>
       </div>`;
   }

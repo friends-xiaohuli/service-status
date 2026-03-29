@@ -2,39 +2,41 @@ package main
 
 import (
 	"crypto/tls"
-	"encoding/binary"
+	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
+	neturl "net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
 // ========== 配置结构 ==========
 
 type ServiceConfig struct {
-	Name         string `json:"name"`
-	Subtitle     string `json:"subtitle,omitempty"`
-	Type         string `json:"type"` // http | tcp | ping | mysql | napcat_qq | minecraft_bedrock | minecraft_java
-	Group        string `json:"group,omitempty"`
-	URL          string `json:"url"`
-	Host         string `json:"host"`
-	Port         int    `json:"port"`
-	Timeout      int    `json:"timeout"`
-	UserID       string `json:"user_id,omitempty"`
-	Token        string `json:"token,omitempty"`
-	Insecure     bool   `json:"insecure"` // true = 跳过 TLS 证书校验（自签名/过期证书）
-	RconHost     string `json:"rcon_host"`
-	RconPort     int    `json:"rcon_port"`
-	RconPassword string `json:"rcon_password"`
+	Name     string `json:"name"`
+	Subtitle string `json:"subtitle,omitempty"`
+	Type     string `json:"type"` // http | tcp | ping | mysql | napcat_qq
+	Group    string `json:"group,omitempty"`
+	URL      string `json:"url"`
+	Host     string `json:"host"`
+	Port     int    `json:"port"`
+	Timeout  int    `json:"timeout"`
+	UserID   string `json:"user_id,omitempty"`
+	Token    string `json:"token,omitempty"`
+	Insecure bool   `json:"insecure"` // true = 跳过 TLS 证书校验（自签名/过期证书）
 }
 
 type ServiceGroupConfig struct {
@@ -63,9 +65,6 @@ type ServiceStatus struct {
 	ResponseTime int64          `json:"response_time"`
 	Message      string         `json:"message"`
 	CheckedAt    string         `json:"checked_at"`
-	PlayerOnline int            `json:"player_online"`
-	PlayerMax    int            `json:"player_max"`
-	HasPlayers   bool           `json:"has_players"`
 	Uptime       float64        `json:"uptime"`
 	CheckCount   int            `json:"check_count"`
 	History      []HistoryEntry `json:"history"`
@@ -76,7 +75,8 @@ type ServiceStatus struct {
 const historySize = 21600 // 30天 × 24H × 30次/H（2分钟间隔）
 
 const (
-	configPath          = "config.json"
+	configFileName      = "config.json"
+	webDirName          = "web"
 	refreshInterval     = 2 * time.Minute
 	configWatchInterval = 2 * time.Second
 )
@@ -147,6 +147,25 @@ func getHistory(name string) *serviceHistory {
 	h := &serviceHistory{}
 	historyMap[name] = h
 	return h
+}
+
+func resolveRuntimePath(name string) string {
+	if name == "" {
+		return ""
+	}
+	if _, err := os.Stat(name); err == nil {
+		return name
+	}
+	exePath, err := os.Executable()
+	if err != nil {
+		return name
+	}
+	exeDir := filepath.Dir(exePath)
+	fallback := filepath.Join(exeDir, name)
+	if _, err := os.Stat(fallback); err == nil {
+		return fallback
+	}
+	return fallback
 }
 
 func loadConfigFile(path string) (Config, error) {
@@ -246,7 +265,7 @@ func watchConfig(path string) {
 
 		prevCfg := getConfig()
 		setConfig(nextCfg)
-		log.Printf("[配置] 已重新加载，服务数量 %d ", len(nextCfg.Services))
+		log.Printf("[配置] 已重新加载，当前服务数量： %d ", len(nextCfg.Services))
 		if prevCfg.Port != nextCfg.Port || prevCfg.HTTPSPort != nextCfg.HTTPSPort || prevCfg.TLSCert != nextCfg.TLSCert || prevCfg.TLSKey != nextCfg.TLSKey {
 			log.Printf("[配置] 监听端口或 TLS 配置已变更，需重启程序后生效")
 		}
@@ -281,21 +300,142 @@ func checkHTTP(cfg ServiceConfig) ServiceStatus {
 	}
 	if err != nil {
 		s.Status = "offline"
-		s.Message = "连接失败"
+		s.Message = classifyHTTPError(cfg.URL, err)
 		return s
 	}
 	defer resp.Body.Close()
 	code := resp.StatusCode
-	s.Message = fmt.Sprintf("HTTP %d", code)
+	bodyPreview, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	serverHeader := strings.ToLower(resp.Header.Get("Server"))
+	bodyText := strings.ToLower(string(bodyPreview))
+	s.Message = classifyHTTPResponse(cfg.URL, code, serverHeader, bodyText)
 	switch {
 	case code >= 200 && code < 400:
 		s.Status = "online"
+	case isVercelDeploymentMissing(code, serverHeader, bodyText):
+		s.Status = "offline"
+	case isGitHubPagesMissingSite(cfg.URL, bodyText):
+		s.Status = "offline"
 	case code >= 400 && code < 500:
 		s.Status = "unknown" // 4xx：服务可达但端点异常
 	default:
 		s.Status = "offline" // 5xx
 	}
 	return s
+}
+
+func classifyHTTPError(rawURL string, err error) string {
+	if strings.TrimSpace(rawURL) == "" {
+		return "缺少 URL"
+	}
+
+	var urlErr *neturl.Error
+	if errors.As(err, &urlErr) {
+		if urlErr.Timeout() {
+			return "请求超时"
+		}
+		err = urlErr.Err
+	}
+
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return "DNS 解析失败"
+	}
+
+	var unknownAuthorityErr x509.UnknownAuthorityError
+	if errors.As(err, &unknownAuthorityErr) {
+		return "TLS 证书不受信任"
+	}
+
+	var hostnameErr x509.HostnameError
+	if errors.As(err, &hostnameErr) {
+		return "TLS 主机名不匹配"
+	}
+
+	var certInvalidErr x509.CertificateInvalidError
+	if errors.As(err, &certInvalidErr) {
+		return "TLS 证书无效"
+	}
+
+	switch {
+	case errors.Is(err, syscall.ECONNREFUSED):
+		return "连接被拒绝"
+	case errors.Is(err, syscall.ECONNRESET):
+		return "连接被重置"
+	case errors.Is(err, syscall.ECONNABORTED):
+		return "连接被中止"
+	case errors.Is(err, syscall.ETIMEDOUT):
+		return "连接超时"
+	}
+
+	text := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(text, "unsupported protocol scheme"):
+		return "URL 缺少协议"
+	case strings.Contains(text, "no such host"):
+		return "DNS 解析失败"
+	case strings.Contains(text, "certificate signed by unknown authority"):
+		return "TLS 证书不受信任"
+	case strings.Contains(text, "certificate is valid for"), strings.Contains(text, "not ") && strings.Contains(text, "requested server name"):
+		return "TLS 主机名不匹配"
+	case strings.Contains(text, "first record does not look like a tls handshake"), strings.Contains(text, "tls: handshake failure"):
+		return "TLS 握手失败"
+	case strings.Contains(text, "connection refused"):
+		return "连接被拒绝"
+	case strings.Contains(text, "connection reset"):
+		return "连接被重置"
+	case strings.Contains(text, "timeout"), strings.Contains(text, "deadline exceeded"):
+		return "请求超时"
+	case strings.Contains(text, "no host in request url"), strings.Contains(text, "missing protocol scheme"):
+		return "URL 配置错误"
+	case strings.Contains(text, "eof"):
+		return "连接意外关闭"
+	}
+
+	return "连接失败"
+}
+
+func classifyHTTPResponse(rawURL string, code int, serverHeader, bodyText string) string {
+	if isVercelDeploymentMissing(code, serverHeader, bodyText) {
+		return "Vercel 不存在"
+	}
+	if code == http.StatusNotFound {
+		if isGitHubPagesMissingSite(rawURL, bodyText) {
+			return "GitHub Pages 不存在"
+		}
+		if isGitHubPagesHost(rawURL) {
+			return "GitHub Pages 404"
+		}
+		if strings.Contains(serverHeader, "vercel") || strings.Contains(bodyText, "deployment_not_found") || strings.Contains(bodyText, "404: not_found") {
+			return "Vercel 404"
+		}
+		return "HTTP 404"
+	}
+	return fmt.Sprintf("HTTP %d", code)
+}
+
+func isVercelDeploymentMissing(code int, serverHeader, bodyText string) bool {
+	if code != http.StatusNotFound {
+		return false
+	}
+	if !strings.Contains(serverHeader, "vercel") && !strings.Contains(bodyText, "deployment_not_found") && !strings.Contains(bodyText, "404: not_found") {
+		return false
+	}
+	return strings.Contains(bodyText, "deployment_not_found")
+}
+
+func isGitHubPagesMissingSite(rawURL, bodyText string) bool {
+	_ = rawURL
+	return strings.Contains(bodyText, "there isn't a github pages site here")
+}
+
+func isGitHubPagesHost(rawURL string) bool {
+	u, err := http.NewRequest(http.MethodGet, rawURL, nil)
+	if err != nil || u.URL == nil {
+		return false
+	}
+	host := strings.ToLower(u.URL.Hostname())
+	return strings.HasSuffix(host, ".github.io") || host == "github.io"
 }
 
 func checkTCP(cfg ServiceConfig) ServiceStatus {
@@ -500,6 +640,18 @@ func checkNapCatQQ(cfg ServiceConfig) ServiceStatus {
 	return s
 }
 
+func readFull(conn net.Conn, buf []byte) (int, error) {
+	total := 0
+	for total < len(buf) {
+		n, err := conn.Read(buf[total:])
+		total += n
+		if err != nil {
+			return total, err
+		}
+	}
+	return total, nil
+}
+
 // ========== PING ==========
 
 func checkPing(cfg ServiceConfig) ServiceStatus {
@@ -556,247 +708,6 @@ func checkPing(cfg ServiceConfig) ServiceStatus {
 	return s
 }
 
-// ========== RCON ==========
-
-func rconSend(conn net.Conn, reqID int32, typ int32, payload string) error {
-	body := []byte(payload)
-	length := int32(4 + 4 + len(body) + 2)
-	buf := make([]byte, 0, 4+length)
-	buf = appendInt32LE(buf, length)
-	buf = appendInt32LE(buf, reqID)
-	buf = appendInt32LE(buf, typ)
-	buf = append(buf, body...)
-	buf = append(buf, 0x00, 0x00)
-	_, err := conn.Write(buf)
-	return err
-}
-
-func rconRecv(conn net.Conn) (length, reqID, typ int32, payload string, err error) {
-	header := make([]byte, 12)
-	if _, err = readFull(conn, header); err != nil {
-		return
-	}
-	length = readInt32LE(header[0:4])
-	reqID = readInt32LE(header[4:8])
-	typ = readInt32LE(header[8:12])
-	remaining := int(length) - 8
-	if remaining < 2 || remaining > 4096 {
-		err = fmt.Errorf("RCON 包长度异常: %d", remaining)
-		return
-	}
-	data := make([]byte, remaining)
-	if _, err = readFull(conn, data); err != nil {
-		return
-	}
-	end := len(data)
-	for end > 0 && data[end-1] == 0 {
-		end--
-	}
-	payload = string(data[:end])
-	return
-}
-
-func readFull(conn net.Conn, buf []byte) (int, error) {
-	total := 0
-	for total < len(buf) {
-		n, err := conn.Read(buf[total:])
-		total += n
-		if err != nil {
-			return total, err
-		}
-	}
-	return total, nil
-}
-
-func appendInt32LE(b []byte, v int32) []byte {
-	return append(b, byte(v), byte(v>>8), byte(v>>16), byte(v>>24))
-}
-
-func readInt32LE(b []byte) int32 {
-	return int32(b[0]) | int32(b[1])<<8 | int32(b[2])<<16 | int32(b[3])<<24
-}
-
-func queryRCON(cfg ServiceConfig, timeout time.Duration) (online, max int, err error) {
-	host := cfg.RconHost
-	if host == "" {
-		host = cfg.Host
-	}
-	port := cfg.RconPort
-	if port == 0 {
-		port = 25575
-	}
-	conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", host, port), timeout)
-	if err != nil {
-		return 0, 0, fmt.Errorf("RCON 连接失败: %v", err)
-	}
-	defer conn.Close()
-	conn.SetDeadline(time.Now().Add(timeout))
-
-	if err = rconSend(conn, 1, 3, cfg.RconPassword); err != nil {
-		return 0, 0, err
-	}
-	_, reqID, _, _, err := rconRecv(conn)
-	if err != nil {
-		return 0, 0, err
-	}
-	if reqID == -1 {
-		return 0, 0, fmt.Errorf("RCON 密码错误")
-	}
-	if err = rconSend(conn, 2, 2, "list"); err != nil {
-		return 0, 0, err
-	}
-	_, _, _, resp, err := rconRecv(conn)
-	if err != nil {
-		return 0, 0, err
-	}
-	log.Printf("[RCON %s] list → %q", cfg.Name, resp)
-
-	var n int
-	if n, err = fmt.Sscanf(resp, "There are %d of a max of %d players online", &online, &max); n == 2 {
-		return online, max, nil
-	}
-	if idx := strings.Index(resp, "("); idx >= 0 {
-		fmt.Sscanf(resp[idx:], "(%d/%d)", &online, &max)
-		if max > 0 {
-			return online, max, nil
-		}
-	}
-	return 0, 0, fmt.Errorf("无法解析 list 响应: %s", resp)
-}
-
-// ========== Minecraft Bedrock ==========
-
-func checkMinecraftBedrock(cfg ServiceConfig) ServiceStatus {
-	timeout := time.Duration(cfg.Timeout) * time.Second
-	if cfg.Timeout == 0 {
-		timeout = 5 * time.Second
-	}
-
-	s := ServiceStatus{
-		Name:      cfg.Name,
-		Type:      cfg.Type,
-		CheckedAt: time.Now().Format("15:04:05"),
-	}
-
-	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
-	conn, err := net.DialTimeout("udp", addr, timeout)
-	if err != nil {
-		s.Status = "offline"
-		s.Message = "连接失败"
-		return s
-	}
-	defer conn.Close()
-
-	magic := []byte{0x00, 0xff, 0xff, 0x00, 0xfe, 0xfe, 0xfe, 0xfe,
-		0xfd, 0xfd, 0xfd, 0xfd, 0x12, 0x34, 0x56, 0x78}
-	ts := make([]byte, 8)
-	binary.LittleEndian.PutUint64(ts, uint64(time.Now().UnixMilli()))
-	guid := []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08}
-
-	buildPing := func(id byte) []byte {
-		p := append([]byte{id}, ts...)
-		p = append(p, magic...)
-		p = append(p, guid...)
-		return p
-	}
-
-	buf := make([]byte, 2048)
-	var n int
-	start := time.Now()
-
-	for _, pingID := range []byte{0x01, 0x02} {
-		conn.SetDeadline(time.Now().Add(timeout))
-		if _, err = conn.Write(buildPing(pingID)); err != nil {
-			continue
-		}
-		n, err = conn.Read(buf)
-		if err == nil && n > 33 {
-			break
-		}
-	}
-
-	elapsed := time.Since(start).Milliseconds()
-	s.ResponseTime = elapsed
-
-	if err != nil || n == 0 {
-		s.Status = "offline"
-		s.Message = "无响应"
-		return s
-	}
-
-	if buf[0] != 0x1c {
-		s.Status = "unknown"
-		s.Message = fmt.Sprintf("响应异常(0x%02x)", buf[0])
-		return s
-	}
-
-	s.Status = "online"
-	s.Message = "在线"
-
-	if cfg.RconPassword != "" {
-		if online, max, rerr := queryRCON(cfg, timeout); rerr == nil {
-			s.PlayerOnline = online
-			s.PlayerMax = max
-			s.HasPlayers = true
-		} else {
-			log.Printf("[RCON %s] %v", cfg.Name, rerr)
-		}
-	}
-
-	const motdOffset = 1 + 8 + 8 + 16
-	if n >= motdOffset+2 {
-		strLen := int(binary.BigEndian.Uint16(buf[motdOffset : motdOffset+2]))
-		end := motdOffset + 2 + strLen
-		if end > n {
-			end = n
-		}
-		if end > motdOffset+2 {
-			parts := strings.Split(string(buf[motdOffset+2:end]), ";")
-			if len(parts) >= 6 && !s.HasPlayers {
-				if online, err2 := strconv.Atoi(strings.TrimSpace(parts[4])); err2 == nil {
-					s.PlayerOnline = online
-				}
-				if max, err2 := strconv.Atoi(strings.TrimSpace(parts[5])); err2 == nil {
-					s.PlayerMax = max
-				}
-				s.HasPlayers = true
-			}
-			if len(parts) >= 2 {
-				s.Message = strings.TrimSpace(parts[1])
-			}
-		}
-	}
-	return s
-}
-
-// ========== Minecraft Java ==========
-
-func checkMinecraftJava(cfg ServiceConfig) ServiceStatus {
-	timeout := time.Duration(cfg.Timeout) * time.Second
-	if cfg.Timeout == 0 {
-		timeout = 5 * time.Second
-	}
-	s := ServiceStatus{
-		Name:      cfg.Name,
-		Type:      cfg.Type,
-		CheckedAt: time.Now().Format("15:04:05"),
-	}
-	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
-	start := time.Now()
-	conn, err := net.DialTimeout("tcp", addr, timeout)
-	elapsed := time.Since(start).Milliseconds()
-	s.ResponseTime = elapsed
-	if err != nil {
-		s.Status = "offline"
-		s.Message = "连接失败"
-		return s
-	}
-	conn.Close()
-	s.Status = "online"
-	s.Message = "端口开放"
-	return s
-}
-
 func checkService(cfg ServiceConfig) ServiceStatus {
 	switch cfg.Type {
 	case "http":
@@ -809,10 +720,6 @@ func checkService(cfg ServiceConfig) ServiceStatus {
 		return checkNapCatQQ(cfg)
 	case "ping":
 		return checkPing(cfg)
-	case "minecraft_bedrock":
-		return checkMinecraftBedrock(cfg)
-	case "minecraft_java":
-		return checkMinecraftJava(cfg)
 	default:
 		return ServiceStatus{
 			Name:      cfg.Name,
@@ -875,6 +782,9 @@ func apiStatusHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
+	configPath := resolveRuntimePath(configFileName)
+	webPath := resolveRuntimePath(webDirName)
+
 	cfg, err := loadConfigFile(configPath)
 	if err != nil {
 		log.Fatalf("加载 config.json 失败: %v", err)
@@ -894,7 +804,7 @@ func main() {
 	}()
 
 	http.HandleFunc("/api/status", apiStatusHandler)
-	http.Handle("/", http.FileServer(http.Dir("web")))
+	http.Handle("/", http.FileServer(http.Dir(webPath)))
 
 	addr := ":" + getConfig().Port
 	log.Printf("服务状态面板已启动 → http://localhost%s", addr)

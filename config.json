@@ -30,6 +30,12 @@
           "type": "http",
           "url": "https://dnai18napi.0201799.xyz/",
           "timeout": 5
+        },
+        {
+          "name": "恐鬼症资讯镜像站点",
+          "type": "http",
+          "url": "https://www.072100000.xyz/",
+          "timeout": 5
         }
       ]
     },
@@ -46,23 +52,35 @@
       ]
     },
     {
-      "name": "测试分组",
+      "name": "基础分组",
       "services": [
         {
-          "name": "测试服务器",
+          "name": "主云服务",
+          "subtitle": "上海·腾讯云",
           "type": "ping",
           "host": "101.43.43.100",
           "port": 3366,
           "timeout": 5
         },
         {
-          "name": "NCQQ服务",
+          "name": "NCQQ基础服务",
           "type": "napcat_qq",
           "host": "101.43.43.100",
           "port": 6099,
           "timeout": 5
         }
-
+      ]
+    },
+    {
+      "name": "测试",
+      "services": [
+        {
+          "name": "测试",
+          "subtitle": "",
+          "type": "http",
+          "url": "https://misod1e.github.io/",
+          "timeout": 5
+        }
       ]
     }
   ]
