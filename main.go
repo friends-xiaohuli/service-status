@@ -39,12 +39,14 @@ type ServiceConfig struct {
 	Timeout  int    `json:"timeout"`
 	UserID   string `json:"user_id,omitempty"`
 	Token    string `json:"token,omitempty"`
-	Insecure bool   `json:"insecure"` // true = 跳过 TLS 证书校验（自签名/过期证书）
+	Insecure bool   `json:"insecure"`          // true = 跳过 TLS 证书校验（自签名/过期证书）
+	Display  *bool  `json:"display,omitempty"` // nil/true = 展示，false = 隐藏
 }
 
 type ServiceGroupConfig struct {
 	Name        string          `json:"name"`
 	Description string          `json:"description,omitempty"`
+	Display     *bool           `json:"display,omitempty"` // nil/true = 展示，false = 隐藏
 	Services    []ServiceConfig `json:"services"`
 }
 
@@ -249,6 +251,30 @@ func formatStorageDisplayTime(t time.Time) string {
 	return fmt.Sprintf("%s:%02d", t.Format("2006-01-02 15:04:05"), t.Nanosecond()/1e7)
 }
 
+func formatNapCatGeneratedAtDisplay(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+
+	layouts := []string{
+		time.RFC3339Nano,
+		time.RFC3339,
+		"2006-01-02 15:04:05.999999999Z07:00",
+		"2006-01-02 15:04:05Z07:00",
+		"2006-01-02 15:04:05.999999999",
+		"2006-01-02 15:04:05",
+		"2006-01-02 15:04",
+	}
+	for _, layout := range layouts {
+		if t, err := time.Parse(layout, raw); err == nil {
+			return east8Time(t).Format("01-02 15:04")
+		}
+	}
+
+	return raw
+}
+
 func loadConfigFile(path string) (Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -269,14 +295,16 @@ func loadConfigFile(path string) (Config, error) {
 
 func normalizeConfig(raw Config) Config {
 	cfg := Config{
-		Port:          raw.Port,
-		HTTPSPort:     raw.HTTPSPort,
-		TLSCert:       raw.TLSCert,
-		TLSKey:        raw.TLSKey,
-		ServiceGroups: raw.ServiceGroups,
+		Port:      raw.Port,
+		HTTPSPort: raw.HTTPSPort,
+		TLSCert:   raw.TLSCert,
+		TLSKey:    raw.TLSKey,
 	}
 
 	appendService := func(groupName string, svc ServiceConfig) {
+		if !isDisplayEnabled(svc.Display) {
+			return
+		}
 		svc.Group = strings.TrimSpace(svc.Group)
 		if svc.Group == "" {
 			svc.Group = strings.TrimSpace(groupName)
@@ -288,12 +316,32 @@ func normalizeConfig(raw Config) Config {
 		appendService("", svc)
 	}
 	for _, group := range raw.ServiceGroups {
+		if !isDisplayEnabled(group.Display) {
+			continue
+		}
+
+		visibleGroup := ServiceGroupConfig{
+			Name:        group.Name,
+			Description: group.Description,
+			Display:     group.Display,
+		}
 		for _, svc := range group.Services {
+			if !isDisplayEnabled(svc.Display) {
+				continue
+			}
+			visibleGroup.Services = append(visibleGroup.Services, svc)
 			appendService(group.Name, svc)
+		}
+		if len(visibleGroup.Services) > 0 {
+			cfg.ServiceGroups = append(cfg.ServiceGroups, visibleGroup)
 		}
 	}
 
 	return cfg
+}
+
+func isDisplayEnabled(display *bool) bool {
+	return display == nil || *display
 }
 
 func setConfig(cfg Config) {
@@ -618,7 +666,7 @@ func checkMySQL(cfg ServiceConfig) ServiceStatus {
 		version := strings.TrimSpace(string(payload[1:versionEnd]))
 		s.Status = "online"
 		if version != "" {
-			s.Message = fmt.Sprintf("MySQL %s", version)
+			s.Message = fmt.Sprintf("MySQL version %s", version)
 		} else {
 			s.Message = "MySQL 握手成功"
 		}
@@ -696,10 +744,17 @@ func checkNapCatQQ(cfg ServiceConfig) ServiceStatus {
 		return s
 	}
 
+	generatedAt, _ := result["generatedAt"].(string)
+	generatedAtDisplay := formatNapCatGeneratedAtDisplay(generatedAt)
+
 	configVal, ok := result["config"].(map[string]any)
 	if !ok {
 		s.Status = "unknown"
-		s.Message = "缺少 config 字段"
+		if generatedAtDisplay != "" {
+			s.Message = generatedAtDisplay
+		} else {
+			s.Message = "缺少 config 字段"
+		}
 		return s
 	}
 
@@ -707,18 +762,30 @@ func checkNapCatQQ(cfg ServiceConfig) ServiceStatus {
 	prefix = strings.TrimSpace(prefix)
 	if prefix == "" {
 		s.Status = "unknown"
-		s.Message = "缺少 config.prefix"
+		if generatedAtDisplay != "" {
+			s.Message = generatedAtDisplay
+		} else {
+			s.Message = "缺少 config.prefix"
+		}
 		return s
 	}
 
 	if prefix == "#napcat" {
 		s.Status = "online"
-		s.Message = "prefix=#napcat"
+		if generatedAtDisplay != "" {
+			s.Message = fmt.Sprintf("generatedAt = %s", generatedAtDisplay)
+		} else {
+			s.Message = fmt.Sprintf("prefix= %s", prefix)
+		}
 		return s
 	}
 
 	s.Status = "unknown"
-	s.Message = fmt.Sprintf("prefix=%s", prefix)
+	if generatedAtDisplay != "" {
+		s.Message = generatedAtDisplay
+	} else {
+		s.Message = fmt.Sprintf("prefix= %s", prefix)
+	}
 	return s
 }
 

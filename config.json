@@ -29,13 +29,15 @@
           "name": "二重螺旋翻译API",
           "type": "http",
           "url": "https://dnai18napi.0201799.xyz/",
-          "timeout": 5
+          "timeout": 5,
+          "display": false
         },
         {
           "name": "恐鬼症资讯镜像站点",
           "type": "http",
           "url": "https://www.072100000.xyz/",
-          "timeout": 5
+          "timeout": 5,
+          "display": false
         }
       ]
     },
@@ -80,6 +82,7 @@
     },
     {
       "name": "测试",
+      "display": false,
       "services": [
         {
           "name": "测试",
