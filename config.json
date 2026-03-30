@@ -52,7 +52,7 @@
       ]
     },
     {
-      "name": "基础分组",
+      "name": "基础服务",
       "services": [
         {
           "name": "主云服务",
@@ -67,6 +67,13 @@
           "type": "napcat_qq",
           "host": "101.43.43.100",
           "port": 6099,
+          "timeout": 5
+        },
+        {
+          "name": "TRSS基础服务",
+          "subtitle": "Guoba TRSS Server",
+          "type": "http",
+          "url": "http://101.43.43.100:2536/guoba/#/",
           "timeout": 5
         }
       ]

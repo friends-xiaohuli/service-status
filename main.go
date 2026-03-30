@@ -1,8 +1,10 @@
 package main
 
 import (
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base32"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,6 +18,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -72,14 +75,17 @@ type ServiceStatus struct {
 
 // ========== 可用率 & 历史追踪 ==========
 
-const historySize = 21600 // 30天 × 24H × 30次/H（2分钟间隔）
-
 const (
-	configFileName      = "config.json"
-	webDirName          = "web"
-	refreshInterval     = 2 * time.Minute
-	configWatchInterval = 2 * time.Second
+	configFileName          = "config.json"
+	webDirName              = "web"
+	historyDBFileName       = "status-history.db"
+	refreshInterval         = 2 * time.Minute
+	configWatchInterval     = 2 * time.Second
+	memoryHistoryRetention  = 24 * time.Hour
+	persistentHistoryWindow = 30 * 24 * time.Hour
 )
+
+var east8Location = time.FixedZone("UTC+8", 8*60*60)
 
 type HistoryEntry struct {
 	Status       string `json:"status"`
@@ -97,8 +103,23 @@ func (h *serviceHistory) record(e HistoryEntry) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.entries = append(h.entries, e)
-	if len(h.entries) > historySize {
-		h.entries = h.entries[1:]
+	h.pruneLocked(e.Ts - int64(memoryHistoryRetention/time.Second))
+}
+
+func (h *serviceHistory) replace(entries []HistoryEntry) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.entries = append([]HistoryEntry(nil), entries...)
+	h.pruneLocked(time.Now().Add(-memoryHistoryRetention).Unix())
+}
+
+func (h *serviceHistory) pruneLocked(cutoff int64) {
+	firstValid := 0
+	for firstValid < len(h.entries) && h.entries[firstValid].Ts < cutoff {
+		firstValid++
+	}
+	if firstValid > 0 {
+		h.entries = append([]HistoryEntry(nil), h.entries[firstValid:]...)
 	}
 }
 
@@ -136,16 +157,17 @@ var (
 	lastRefreshed int64
 	historyMap    = map[string]*serviceHistory{}
 	historyLock   sync.Mutex
+	historyDB     *historyStore
 )
 
-func getHistory(name string) *serviceHistory {
+func getHistory(key string) *serviceHistory {
 	historyLock.Lock()
 	defer historyLock.Unlock()
-	if h, ok := historyMap[name]; ok {
+	if h, ok := historyMap[key]; ok {
 		return h
 	}
 	h := &serviceHistory{}
-	historyMap[name] = h
+	historyMap[key] = h
 	return h
 }
 
@@ -166,6 +188,65 @@ func resolveRuntimePath(name string) string {
 		return fallback
 	}
 	return fallback
+}
+
+func resolveWritablePath(name string) string {
+	if name == "" {
+		return ""
+	}
+	if filepath.IsAbs(name) {
+		return name
+	}
+	if wd, err := os.Getwd(); err == nil {
+		return filepath.Join(wd, name)
+	}
+	exePath, err := os.Executable()
+	if err != nil {
+		return name
+	}
+	return filepath.Join(filepath.Dir(exePath), name)
+}
+
+func serviceKey(cfg ServiceConfig) string {
+	keyMaterial := legacyServiceKey(cfg)
+	sum := sha256.Sum256([]byte(keyMaterial))
+	encoded := base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(sum[:10])
+	return strings.ToLower(encoded)
+}
+
+func legacyServiceKey(cfg ServiceConfig) string {
+	parts := []string{
+		strings.TrimSpace(cfg.Group),
+		strings.TrimSpace(cfg.Name),
+		strings.TrimSpace(cfg.Type),
+		strings.TrimSpace(cfg.URL),
+		strings.TrimSpace(cfg.Host),
+		strconv.Itoa(cfg.Port),
+		strings.TrimSpace(cfg.UserID),
+	}
+	return strings.Join(parts, "\x1f")
+}
+
+func serviceKeyCandidates(cfg ServiceConfig) []string {
+	canonical := serviceKey(cfg)
+	legacy := legacyServiceKey(cfg)
+	if canonical == legacy {
+		return []string{canonical}
+	}
+	return []string{canonical, legacy}
+}
+
+func east8Time(t time.Time) time.Time {
+	return t.In(east8Location)
+}
+
+func formatHistoryTime(t time.Time) string {
+	return east8Time(t).Format("01-02 15:04")
+}
+
+func formatStorageDisplayTime(t time.Time) string {
+	t = east8Time(t)
+	return fmt.Sprintf("%s:%02d", t.Format("2006-01-02 15:04:05"), t.Nanosecond()/1e7)
 }
 
 func loadConfigFile(path string) (Config, error) {
@@ -265,6 +346,7 @@ func watchConfig(path string) {
 
 		prevCfg := getConfig()
 		setConfig(nextCfg)
+		restoreRecentHistory(nextCfg.Services)
 		log.Printf("[配置] 已重新加载，当前服务数量： %d ", len(nextCfg.Services))
 		if prevCfg.Port != nextCfg.Port || prevCfg.HTTPSPort != nextCfg.HTTPSPort || prevCfg.TLSCert != nextCfg.TLSCert || prevCfg.TLSKey != nextCfg.TLSKey {
 			log.Printf("[配置] 监听端口或 TLS 配置已变更，需重启程序后生效")
@@ -443,7 +525,7 @@ func checkTCP(cfg ServiceConfig) ServiceStatus {
 	if cfg.Timeout == 0 {
 		timeout = 5 * time.Second
 	}
-	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
+	addr := net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))
 	start := time.Now()
 	conn, err := net.DialTimeout("tcp", addr, timeout)
 	elapsed := time.Since(start).Milliseconds()
@@ -481,7 +563,7 @@ func checkMySQL(cfg ServiceConfig) ServiceStatus {
 		CheckedAt: time.Now().Format("15:04:05"),
 	}
 
-	addr := fmt.Sprintf("%s:%d", cfg.Host, port)
+	addr := net.JoinHostPort(cfg.Host, strconv.Itoa(port))
 	start := time.Now()
 	conn, err := net.DialTimeout("tcp", addr, timeout)
 	if err != nil {
@@ -733,33 +815,151 @@ func checkService(cfg ServiceConfig) ServiceStatus {
 
 // ========== 刷新 & HTTP ==========
 
+type serviceObservation struct {
+	index int
+	key   string
+	cfg   ServiceConfig
+	entry HistoryEntry
+	state ServiceStatus
+}
+
+func loadPersistedHistories(services []ServiceConfig, since time.Time) (map[string][]HistoryEntry, error) {
+	result := make(map[string][]HistoryEntry)
+	if historyDB == nil || len(services) == 0 {
+		return result, nil
+	}
+
+	keys := make([]string, 0, len(services)*2)
+	aliasToCanonical := make(map[string]string, len(services)*2)
+	for _, svc := range services {
+		canonical := serviceKey(svc)
+		for _, key := range serviceKeyCandidates(svc) {
+			keys = append(keys, key)
+			aliasToCanonical[key] = canonical
+		}
+	}
+
+	entriesByKey, err := historyDB.LoadWindow(keys, since)
+	if err != nil {
+		return nil, err
+	}
+
+	for aliasKey, entries := range entriesByKey {
+		canonical := aliasToCanonical[aliasKey]
+		result[canonical] = append(result[canonical], entries...)
+	}
+
+	for canonical, entries := range result {
+		sort.Slice(entries, func(i, j int) bool {
+			return entries[i].Ts < entries[j].Ts
+		})
+		result[canonical] = entries
+	}
+
+	return result, nil
+}
+
+func restoreRecentHistory(services []ServiceConfig) {
+	if historyDB == nil || len(services) == 0 {
+		return
+	}
+
+	entriesByKey, err := loadPersistedHistories(services, time.Now().Add(-memoryHistoryRetention))
+	if err != nil {
+		log.Printf("[存储] 恢复最近历史失败: %v", err)
+		return
+	}
+
+	totalEntries := 0
+	for _, svc := range services {
+		key := serviceKey(svc)
+		entries := entriesByKey[key]
+		totalEntries += len(entries)
+		getHistory(key).replace(entries)
+	}
+	if totalEntries > 0 {
+		log.Printf("[存储] 已恢复最近 24h 历史，共 %d 条", totalEntries)
+	}
+}
+
 func refreshAllStatus() {
 	refreshLock.Lock()
 	defer refreshLock.Unlock()
 
 	services := getServicesSnapshot()
 	results := make([]ServiceStatus, len(services))
+	observations := make([]serviceObservation, len(services))
 	var wg sync.WaitGroup
 	for i, svc := range services {
 		wg.Add(1)
 		go func(idx int, s ServiceConfig) {
 			defer wg.Done()
 			r := checkService(s)
-			r.Group = s.Group
-			r.Subtitle = s.Subtitle
-			h := getHistory(s.Name)
 			now := time.Now()
-			h.record(HistoryEntry{
-				Status:       r.Status,
-				ResponseTime: r.ResponseTime,
-				Time:         now.Format("01-02 15:04"),
-				Ts:           now.Unix(),
-			})
-			r.History, r.Uptime, r.CheckCount = h.snapshot()
-			results[idx] = r
+			observations[idx] = serviceObservation{
+				index: idx,
+				key:   serviceKey(s),
+				cfg:   s,
+				entry: HistoryEntry{
+					Status:       r.Status,
+					ResponseTime: r.ResponseTime,
+					Time:         formatHistoryTime(now),
+					Ts:           now.Unix(),
+				},
+				state: r,
+			}
 		}(i, svc)
 	}
 	wg.Wait()
+
+	for _, observation := range observations {
+		h := getHistory(observation.key)
+		h.record(observation.entry)
+		if historyDB != nil {
+			if err := historyDB.Insert(observation.key, observation.cfg, observation.entry); err != nil {
+				log.Printf("[存储] 写入历史失败(%s): %v", observation.cfg.Name, err)
+			}
+		}
+	}
+
+	if historyDB != nil {
+		if err := historyDB.MaybeCleanup(time.Now()); err != nil {
+			log.Printf("[存储] 清理过期历史失败: %v", err)
+		}
+	}
+
+	historiesByKey := map[string][]HistoryEntry{}
+	if historyDB != nil && len(observations) > 0 {
+		serviceMap := make(map[string]ServiceConfig, len(observations))
+		for _, observation := range observations {
+			serviceMap[observation.key] = observation.cfg
+		}
+		serviceList := make([]ServiceConfig, 0, len(serviceMap))
+		for _, svc := range serviceMap {
+			serviceList = append(serviceList, svc)
+		}
+		dbHistories, err := loadPersistedHistories(serviceList, time.Now().Add(-persistentHistoryWindow))
+		if err != nil {
+			log.Printf("[存储] 读取 30 天历史失败，将退回内存缓存: %v", err)
+		} else {
+			historiesByKey = dbHistories
+		}
+	}
+
+	for _, observation := range observations {
+		r := observation.state
+		r.Group = observation.cfg.Group
+		r.Subtitle = observation.cfg.Subtitle
+		memHistory, memUptime, memCount := getHistory(observation.key).snapshot()
+		r.Uptime = memUptime
+		r.CheckCount = memCount
+		if history, ok := historiesByKey[observation.key]; ok && len(history) > 0 {
+			r.History = history
+		} else {
+			r.History = memHistory
+		}
+		results[observation.index] = r
+	}
 
 	statusLock.Lock()
 	lastStatus = results
@@ -772,7 +972,7 @@ func apiStatusHandler(w http.ResponseWriter, r *http.Request) {
 	statusLock.RLock()
 	resp := APIResponse{
 		RefreshedAt: lastRefreshed,
-		Interval:    120,
+		Interval:    int(refreshInterval / time.Second),
 		Services:    lastStatus,
 	}
 	statusLock.RUnlock()
@@ -784,12 +984,22 @@ func apiStatusHandler(w http.ResponseWriter, r *http.Request) {
 func main() {
 	configPath := resolveRuntimePath(configFileName)
 	webPath := resolveRuntimePath(webDirName)
+	historyDBPath := resolveWritablePath(historyDBFileName)
 
 	cfg, err := loadConfigFile(configPath)
 	if err != nil {
 		log.Fatalf("加载 config.json 失败: %v", err)
 	}
 	setConfig(cfg)
+
+	historyDB, err = openHistoryStore(historyDBPath)
+	if err != nil {
+		log.Printf("[存储] SQLite 未启用，将仅使用内存缓存: %v", err)
+	} else {
+		defer historyDB.Close()
+		restoreRecentHistory(cfg.Services)
+		log.Printf("[存储] SQLite 历史库已启用: %s", historyDBPath)
+	}
 
 	refreshAllStatus()
 	go watchConfig(configPath)
