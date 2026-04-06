@@ -73,6 +73,7 @@ type ServiceStatus struct {
 	Status       string         `json:"status"`
 	ResponseTime int64          `json:"response_time"`
 	Message      string         `json:"message"`
+	Meta         string         `json:"meta,omitempty"`
 	CheckedAt    string         `json:"checked_at"`
 	Uptime       float64        `json:"uptime"`
 	CheckCount   int            `json:"check_count"`
@@ -89,7 +90,10 @@ const (
 	configFileName          = "config.json"
 	webDirName              = "web"
 	historyDBFileName       = "status-history.db"
-	refreshInterval         = 2 * time.Minute
+	apiRefreshInterval      = 1 * time.Minute
+	schedulerTickInterval   = 1 * time.Minute
+	retryRefreshInterval    = 2 * time.Minute
+	stableRefreshInterval   = 5 * time.Minute
 	configWatchInterval     = 2 * time.Second
 	memoryHistoryRetention  = 24 * time.Hour
 	persistentHistoryWindow = 30 * 24 * time.Hour
@@ -183,7 +187,14 @@ var (
 	historyMap    = map[string]*serviceHistory{}
 	historyLock   sync.Mutex
 	historyDB     *historyStore
+	probeState    = map[string]probeRuntimeState{}
+	probeStateMu  sync.Mutex
 )
+
+type probeRuntimeState struct {
+	LastChecked int64
+	LastStatus  string
+}
 
 func getHistory(key string) *serviceHistory {
 	historyLock.Lock()
@@ -194,6 +205,60 @@ func getHistory(key string) *serviceHistory {
 	h := &serviceHistory{}
 	historyMap[key] = h
 	return h
+}
+
+func nextProbeInterval(status string) time.Duration {
+	if status == "online" {
+		return stableRefreshInterval
+	}
+	return retryRefreshInterval
+}
+
+func shouldCheckServiceNow(key string, now time.Time) bool {
+	probeStateMu.Lock()
+	defer probeStateMu.Unlock()
+
+	state, ok := probeState[key]
+	if !ok || state.LastChecked <= 0 {
+		return true
+	}
+	lastChecked := time.Unix(state.LastChecked, 0)
+	return now.Sub(lastChecked) >= nextProbeInterval(state.LastStatus)
+}
+
+func updateProbeState(key string, checkedAt time.Time, status string) {
+	probeStateMu.Lock()
+	probeState[key] = probeRuntimeState{
+		LastChecked: checkedAt.Unix(),
+		LastStatus:  status,
+	}
+	probeStateMu.Unlock()
+}
+
+func pruneProbeState(validKeys []string) {
+	allowed := make(map[string]struct{}, len(validKeys))
+	for _, key := range validKeys {
+		allowed[key] = struct{}{}
+	}
+
+	probeStateMu.Lock()
+	for key := range probeState {
+		if _, ok := allowed[key]; !ok {
+			delete(probeState, key)
+		}
+	}
+	probeStateMu.Unlock()
+}
+
+func getLastStatusMap() map[string]ServiceStatus {
+	statusLock.RLock()
+	defer statusLock.RUnlock()
+
+	result := make(map[string]ServiceStatus, len(lastStatus))
+	for _, svc := range lastStatus {
+		result[svc.Key] = svc
+	}
+	return result
 }
 
 func resolveRuntimePath(name string) string {
@@ -296,6 +361,50 @@ func formatNapCatGeneratedAtDisplay(raw string) string {
 	}
 
 	return raw
+}
+
+func parseNapCatData(payload map[string]any) map[string]any {
+	value, ok := payload["data"]
+	if !ok {
+		return nil
+	}
+	result, _ := value.(map[string]any)
+	return result
+}
+
+func parseNapCatUptimeFormatted(payload map[string]any) string {
+	data := parseNapCatData(payload)
+	if data == nil {
+		return ""
+	}
+	text, _ := data["uptimeFormatted"].(string)
+	return strings.TrimSpace(text)
+}
+
+func parseNapCatCode(payload map[string]any) (int64, bool) {
+	value, ok := payload["code"]
+	if !ok {
+		return 0, false
+	}
+	switch v := value.(type) {
+	case float64:
+		return int64(v), true
+	case int:
+		return int64(v), true
+	case int64:
+		return v, true
+	case json.Number:
+		parsed, err := v.Int64()
+		if err == nil {
+			return parsed, true
+		}
+	case string:
+		parsed, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+		if err == nil {
+			return parsed, true
+		}
+	}
+	return 0, false
 }
 
 func loadConfigFile(path string) (Config, error) {
@@ -452,38 +561,89 @@ func watchConfig(path string) {
 
 // ========== 检测函数 ==========
 
-func checkHTTP(cfg ServiceConfig) ServiceStatus {
+func httpTransportForConfig(cfg ServiceConfig) http.RoundTripper {
+	if cfg.Insecure {
+		return &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		}
+	}
+	return http.DefaultTransport
+}
+
+func httpClientForConfig(cfg ServiceConfig) *http.Client {
 	timeout := time.Duration(cfg.Timeout) * time.Second
 	if cfg.Timeout == 0 {
 		timeout = 5 * time.Second
 	}
-	transport := http.DefaultTransport
-	if cfg.Insecure {
-		transport = &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		}
+	return &http.Client{
+		Timeout:   timeout,
+		Transport: httpTransportForConfig(cfg),
 	}
-	client := &http.Client{Timeout: timeout, Transport: transport}
-	start := time.Now()
-	resp, err := client.Get(cfg.URL)
-	elapsed := time.Since(start).Milliseconds()
+}
 
-	s := ServiceStatus{
-		Name:         cfg.Name,
-		Type:         cfg.Type,
-		ResponseTime: elapsed,
-		CheckedAt:    time.Now().Format("15:04:05"),
+func executeHTTPProbe(client *http.Client, rawURL string, method string, useRange bool) (*http.Response, int64, error) {
+	req, err := http.NewRequest(method, rawURL, nil)
+	if err != nil {
+		return nil, 0, err
 	}
+	req.Header.Set("Accept-Encoding", "identity")
+	req.Header.Set("User-Agent", "service-status/1.0")
+	if useRange {
+		req.Header.Set("Range", "bytes=0-511")
+	}
+
+	start := time.Now()
+	resp, err := client.Do(req)
+	return resp, time.Since(start).Milliseconds(), err
+}
+
+func shouldFallbackToHTTPGet(rawURL string, code int, serverHeader string) bool {
+	if code == http.StatusMethodNotAllowed || code == http.StatusNotImplemented {
+		return true
+	}
+	if code != http.StatusNotFound {
+		return false
+	}
+	return isGitHubPagesHost(rawURL) || strings.Contains(serverHeader, "vercel")
+}
+
+func checkHTTP(cfg ServiceConfig) ServiceStatus {
+	client := httpClientForConfig(cfg)
+	checkedAt := time.Now().Format("15:04:05")
+	s := ServiceStatus{
+		Name:      cfg.Name,
+		Type:      cfg.Type,
+		CheckedAt: checkedAt,
+	}
+
+	resp, elapsed, err := executeHTTPProbe(client, cfg.URL, http.MethodHead, false)
+	s.ResponseTime = elapsed
 	if err != nil {
 		s.Status = "offline"
 		s.Message = classifyHTTPError(cfg.URL, err)
 		return s
 	}
-	defer resp.Body.Close()
+
 	code := resp.StatusCode
-	bodyPreview, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	serverHeader := strings.ToLower(resp.Header.Get("Server"))
-	bodyText := strings.ToLower(string(bodyPreview))
+	_ = resp.Body.Close()
+
+	bodyText := ""
+	if shouldFallbackToHTTPGet(cfg.URL, code, serverHeader) {
+		resp, elapsed, err = executeHTTPProbe(client, cfg.URL, http.MethodGet, true)
+		s.ResponseTime = elapsed
+		if err != nil {
+			s.Status = "offline"
+			s.Message = classifyHTTPError(cfg.URL, err)
+			return s
+		}
+		defer resp.Body.Close()
+		code = resp.StatusCode
+		serverHeader = strings.ToLower(resp.Header.Get("Server"))
+		bodyPreview, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		bodyText = strings.ToLower(string(bodyPreview))
+	}
+
 	s.Message = classifyHTTPResponse(cfg.URL, code, serverHeader, bodyText)
 	switch {
 	case code >= 200 && code < 400:
@@ -493,9 +653,9 @@ func checkHTTP(cfg ServiceConfig) ServiceStatus {
 	case isGitHubPagesMissingSite(cfg.URL, bodyText):
 		s.Status = "offline"
 	case code >= 400 && code < 500:
-		s.Status = "unknown" // 4xx：服务可达但端点异常
+		s.Status = "unknown"
 	default:
-		s.Status = "offline" // 5xx
+		s.Status = "offline"
 	}
 	return s
 }
@@ -725,11 +885,6 @@ func checkMySQL(cfg ServiceConfig) ServiceStatus {
 }
 
 func checkNapCatQQ(cfg ServiceConfig) ServiceStatus {
-	timeout := time.Duration(cfg.Timeout) * time.Second
-	if cfg.Timeout == 0 {
-		timeout = 5 * time.Second
-	}
-
 	s := ServiceStatus{
 		Name:      cfg.Name,
 		Type:      cfg.Type,
@@ -747,26 +902,24 @@ func checkNapCatQQ(cfg ServiceConfig) ServiceStatus {
 		port = 6099
 	}
 
-	endpoint := fmt.Sprintf("http://%s:%d/plugin/napcat-plugin-builtin/mem/dynamic/info.json", host, port)
+	statusEndpoint := fmt.Sprintf("http://%s:%d/api/Plugin/ext/napcat-plugin-builtin/status", host, port)
+	client := httpClientForConfig(cfg)
 
-	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
+	req, err := http.NewRequest(http.MethodGet, statusEndpoint, nil)
 	if err != nil {
 		s.Status = "offline"
 		s.Message = "请求创建失败"
 		return s
 	}
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Accept-Encoding", "gzip, deflate")
+	req.Header.Set("Cache-Control", "no-cache")
+	req.Header.Set("Pragma", "no-cache")
+	req.Header.Set("Referer", fmt.Sprintf("http://%s:%d/plugin/napcat-plugin-builtin/page/dashboard", host, port))
 	if token := strings.TrimSpace(cfg.Token); token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Authorization", fmt.Sprintf("Bearer %q", token))
 	}
 
-	transport := http.DefaultTransport
-	if cfg.Insecure {
-		transport = &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		}
-	}
-
-	client := &http.Client{Timeout: timeout, Transport: transport}
 	start := time.Now()
 	resp, err := client.Do(req)
 	s.ResponseTime = time.Since(start).Milliseconds()
@@ -778,59 +931,49 @@ func checkNapCatQQ(cfg ServiceConfig) ServiceStatus {
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		s.Status = "offline"
+		if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+			s.Status = "unknown"
+		} else {
+			s.Status = "offline"
+		}
 		s.Message = fmt.Sprintf("HTTP %d", resp.StatusCode)
 		return s
 	}
 
-	var result map[string]any
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	var payload map[string]any
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 512)).Decode(&payload); err != nil {
 		s.Status = "offline"
 		s.Message = "NapCat 响应解析失败"
 		return s
 	}
 
-	generatedAt, _ := result["generatedAt"].(string)
-	generatedAtDisplay := formatNapCatGeneratedAtDisplay(generatedAt)
-
-	configVal, ok := result["config"].(map[string]any)
-	if !ok {
-		s.Status = "unknown"
-		if generatedAtDisplay != "" {
-			s.Message = generatedAtDisplay
-		} else {
-			s.Message = "缺少 config 字段"
+	uptimeText := strings.TrimSpace(parseNapCatUptimeFormatted(payload))
+	if code, ok := parseNapCatCode(payload); ok {
+		switch code {
+		case -1:
+			s.Status = "unknown"
+			s.Message = fmt.Sprintf("HTTP %d · code = -1", resp.StatusCode)
+			return s
+		case 0:
+			s.Status = "online"
+			if uptimeText != "" {
+				s.Message = fmt.Sprintf("HTTP %d · %s", resp.StatusCode, uptimeText)
+			} else {
+				s.Message = fmt.Sprintf("HTTP %d · code = 0", resp.StatusCode)
+			}
+			return s
+		default:
+			s.Status = "unknown"
+			s.Message = fmt.Sprintf("HTTP %d · code = %d", resp.StatusCode, code)
+			return s
 		}
-		return s
 	}
 
-	prefix, _ := configVal["prefix"].(string)
-	prefix = strings.TrimSpace(prefix)
-	if prefix == "" {
-		s.Status = "unknown"
-		if generatedAtDisplay != "" {
-			s.Message = generatedAtDisplay
-		} else {
-			s.Message = "缺少 config.prefix"
-		}
-		return s
-	}
-
-	if prefix == "#napcat" {
-		s.Status = "online"
-		if generatedAtDisplay != "" {
-			s.Message = fmt.Sprintf("generatedAt = %s", generatedAtDisplay)
-		} else {
-			s.Message = fmt.Sprintf("prefix= %s", prefix)
-		}
-		return s
-	}
-
-	s.Status = "unknown"
-	if generatedAtDisplay != "" {
-		s.Message = generatedAtDisplay
+	s.Status = "online"
+	if uptimeText != "" {
+		s.Message = fmt.Sprintf("HTTP %d · %s", resp.StatusCode, uptimeText)
 	} else {
-		s.Message = fmt.Sprintf("prefix= %s", prefix)
+		s.Message = fmt.Sprintf("HTTP %d", resp.StatusCode)
 	}
 	return s
 }
@@ -929,11 +1072,12 @@ func checkService(cfg ServiceConfig) ServiceStatus {
 // ========== 刷新 & HTTP ==========
 
 type serviceObservation struct {
-	index int
-	key   string
-	cfg   ServiceConfig
-	entry HistoryEntry
-	state ServiceStatus
+	index   int
+	key     string
+	cfg     ServiceConfig
+	checked bool
+	entry   HistoryEntry
+	state   ServiceStatus
 }
 
 func loadPersistedHistories(services []ServiceConfig, since time.Time) (map[string][]HistoryEntry, error) {
@@ -999,35 +1143,61 @@ func refreshAllStatus() {
 	refreshLock.Lock()
 	defer refreshLock.Unlock()
 
+	now := time.Now()
 	services := getServicesSnapshot()
+	serviceKeys := make([]string, 0, len(services))
+	for _, svc := range services {
+		serviceKeys = append(serviceKeys, serviceKey(svc))
+	}
+	pruneProbeState(serviceKeys)
+
+	prevStatus := getLastStatusMap()
 	results := make([]ServiceStatus, len(services))
 	observations := make([]serviceObservation, len(services))
 	var wg sync.WaitGroup
 	for i, svc := range services {
+		key := serviceKey(svc)
+		if !shouldCheckServiceNow(key, now) {
+			if cached, ok := prevStatus[key]; ok {
+				cached.Group = svc.Group
+				cached.Subtitle = svc.Subtitle
+				cached.Visible = isDisplayEnabled(svc.Display)
+				results[i] = cached
+				continue
+			}
+		}
+
 		wg.Add(1)
-		go func(idx int, s ServiceConfig) {
+		go func(idx int, key string, s ServiceConfig) {
 			defer wg.Done()
 			r := checkService(s)
-			now := time.Now()
+			checkedAt := time.Now()
 			observations[idx] = serviceObservation{
-				index: idx,
-				key:   serviceKey(s),
-				cfg:   s,
+				index:   idx,
+				key:     key,
+				cfg:     s,
+				checked: true,
 				entry: HistoryEntry{
 					Status:       r.Status,
 					ResponseTime: r.ResponseTime,
-					Time:         formatHistoryTime(now),
-					Ts:           now.Unix(),
+					Time:         formatHistoryTime(checkedAt),
+					Ts:           checkedAt.Unix(),
 				},
 				state: r,
 			}
-		}(i, svc)
+		}(i, key, svc)
 	}
 	wg.Wait()
 
+	checkedCount := 0
 	for _, observation := range observations {
+		if !observation.checked {
+			continue
+		}
+		checkedCount++
 		h := getHistory(observation.key)
 		h.record(observation.entry)
+		updateProbeState(observation.key, time.Unix(observation.entry.Ts, 0), observation.entry.Status)
 		if historyDB != nil {
 			if err := historyDB.Insert(observation.key, observation.cfg, observation.entry); err != nil {
 				log.Printf("[存储] 写入历史失败(%s): %v", observation.cfg.Name, err)
@@ -1045,6 +1215,9 @@ func refreshAllStatus() {
 	if historyDB != nil && len(observations) > 0 {
 		serviceMap := make(map[string]ServiceConfig, len(observations))
 		for _, observation := range observations {
+			if !observation.checked {
+				continue
+			}
 			serviceMap[observation.key] = observation.cfg
 		}
 		serviceList := make([]ServiceConfig, 0, len(serviceMap))
@@ -1060,6 +1233,9 @@ func refreshAllStatus() {
 	}
 
 	for _, observation := range observations {
+		if !observation.checked {
+			continue
+		}
 		r := observation.state
 		r.Key = observation.key
 		r.Group = observation.cfg.Group
@@ -1081,9 +1257,11 @@ func refreshAllStatus() {
 
 	statusLock.Lock()
 	lastStatus = results
-	lastRefreshed = time.Now().Unix()
+	if checkedCount > 0 || lastRefreshed == 0 {
+		lastRefreshed = time.Now().Unix()
+	}
 	statusLock.Unlock()
-	log.Printf("[刷新] 已检测 %d 个服务", len(results))
+	log.Printf("[刷新] 本轮实际检测 %d / %d 个服务", checkedCount, len(results))
 }
 
 func uptimeBasisPointsSince(entries []HistoryEntry, since int64) int {
@@ -1363,13 +1541,14 @@ func serveStatusSummary(w http.ResponseWriter, r *http.Request) {
 			svc.Uptime24BP,
 			svc.Uptime7dBP,
 			svc.Uptime30dBP,
+			svc.Meta,
 		})
 	}
 
 	writeJSON(w, r, http.StatusOK, compactSummaryResponse{
 		V: 2,
 		T: refreshedAt,
-		I: int(refreshInterval / time.Second),
+		I: int(apiRefreshInterval / time.Second),
 		S: rows,
 	}, "public, max-age=15, stale-while-revalidate=45", etag)
 }
@@ -1487,9 +1666,9 @@ func main() {
 	refreshAllStatus()
 	go watchConfig(configPath)
 
-	// 每 2 分钟自动刷新
+	// 每分钟调度一次，单个服务根据上一状态决定 2 分钟或 5 分钟是否到点检测
 	go func() {
-		ticker := time.NewTicker(refreshInterval)
+		ticker := time.NewTicker(schedulerTickInterval)
 		defer ticker.Stop()
 		for range ticker.C {
 			refreshAllStatus()

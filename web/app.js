@@ -1,4 +1,4 @@
-let INTERVAL = 120;
+let INTERVAL = 60;
 let countdown = INTERVAL;
 let allData = [];
 let rangeKey = '24h';
@@ -7,6 +7,10 @@ let fetching = false;
 let historyRequestSeq = 0;
 
 const API_URL = '/api/status';
+const SUMMARY_CACHE_KEY = 'status:web:summary';
+const NEXT_CHECK_CACHE_KEY = 'status:web:next-check';
+const NO_UPDATE_INTERVAL = 60;
+const UPDATED_INTERVAL = 120;
 const RANGE_LABEL = { '24h': '近 24 小时', '7d': '近 7 天', '30d': '近 30 天' };
 const SLOTS = window.innerWidth <= 600 ? 30 : 40;
 const HISTORY_CHUNK_SIZE = 24;
@@ -16,6 +20,12 @@ const historyStore = {
   '24h': {},
   '7d': {},
   '30d': {},
+};
+
+const historyStamp = {
+  '24h': 0,
+  '7d': 0,
+  '30d': 0,
 };
 
 const typeLabels = {
@@ -28,6 +38,42 @@ const typeLabels = {
 
 const TYPE_CODES = ['http', 'tcp', 'ping', 'mysql', 'napcat_qq'];
 const STATUS_CODES = ['online', 'offline', 'unknown'];
+
+function saveLocalCache(key, value) {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch (_) {}
+}
+
+function readLocalCache(key) {
+  try {
+    const raw = localStorage.getItem(key);
+    return raw ? JSON.parse(raw) : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function saveNextCheck(interval) {
+  saveLocalCache(NEXT_CHECK_CACHE_KEY, {
+    interval,
+    dueAt: Date.now() + (interval * 1000),
+  });
+}
+
+function hydrateNextCheck() {
+  const cached = readLocalCache(NEXT_CHECK_CACHE_KEY);
+  if (!cached || !cached.dueAt) {
+    return false;
+  }
+  const remaining = Math.ceil((Number(cached.dueAt) - Date.now()) / 1000);
+  if (!Number.isFinite(remaining) || remaining <= 0) {
+    return false;
+  }
+  INTERVAL = Number(cached.interval) || NO_UPDATE_INTERVAL;
+  countdown = Math.max(1, remaining);
+  return true;
+}
 
 function uptimeClass(p) {
   if (p >= 95) return 'good';
@@ -148,7 +194,19 @@ function decodeSummaryRow(row) {
       '7d': Number.isFinite(row[9]) ? Number(row[9]) : -1,
       '30d': Number.isFinite(row[10]) ? Number(row[10]) : -1,
     },
+    meta: row[11] || '',
   };
+}
+
+function hydrateSummaryCache() {
+  const cached = readLocalCache(SUMMARY_CACHE_KEY);
+  if (!cached || !Array.isArray(cached.s)) {
+    return false;
+  }
+  allData = cached.s.map(decodeSummaryRow);
+  lastRefreshedAt = cached.t || 0;
+  renderAll();
+  return allData.length > 0;
 }
 
 function decodeHistoryPoints(points) {
@@ -246,6 +304,7 @@ function renderCard(service) {
 
   const historyStart = points.length ? formatTime(points[0].ts) : RANGE_LABEL[rangeKey];
   const historyEnd = points.length ? formatTime(points[points.length - 1].ts) : '等待加载';
+  const metaText = formatRefreshTime(lastRefreshedAt);
 
   return `
     <div class="card ${status}">
@@ -257,7 +316,7 @@ function renderCard(service) {
           </div>
           <span class="badge ${status}"><span class="dot"></span>${badgeText}</span>
         </div>
-        <div class="card-sub">${typeLabels[service.type] || service.type} · ${formatRefreshTime(lastRefreshedAt)}</div>
+        <div class="card-sub">${typeLabels[service.type] || service.type} · ${metaText}</div>
         ${service.message ? `<div class="card-msg">· ${service.message}</div>` : ''}
       </div>
       <div>
@@ -333,10 +392,38 @@ function updateOverall(list) {
   document.getElementById('ovPeriod').textContent = RANGE_LABEL[rangeKey];
 }
 
-function resetHistoryStore() {
-  Object.keys(historyStore).forEach(key => {
-    historyStore[key] = {};
+function summarySignature(service) {
+  return JSON.stringify([
+    service.name,
+    service.subtitle,
+    service.group,
+    service.type,
+    service.status,
+    service.response_time,
+    service.message,
+    service.uptimes['24h'],
+    service.uptimes['7d'],
+    service.uptimes['30d'],
+    service.meta,
+  ]);
+}
+
+function diffChangedKeys(prevList, nextList) {
+  const prevMap = new Map(prevList.map(service => [service.key, summarySignature(service)]));
+  const nextKeys = new Set(nextList.map(service => service.key));
+  const changed = nextList
+    .filter(service => prevMap.get(service.key) !== summarySignature(service))
+    .map(service => service.key);
+
+  Object.keys(historyStore).forEach(range => {
+    Object.keys(historyStore[range]).forEach(key => {
+      if (!nextKeys.has(key)) {
+        delete historyStore[range][key];
+      }
+    });
   });
+
+  return changed;
 }
 
 function chunk(array, size) {
@@ -354,15 +441,35 @@ async function requestJSON(url) {
   });
 }
 
-async function syncRangeHistory(range) {
+async function syncRangeHistory(range, changedKeys = [], forceAll = false) {
   if (!allData.length) return;
 
   const seq = ++historyRequestSeq;
   const keys = allData.map(service => service.key).filter(Boolean);
-  const nextState = {};
+  const nextState = { ...historyStore[range] };
+  const stale = historyStamp[range] !== lastRefreshedAt;
+  const wanted = (forceAll || stale)
+    ? keys.slice()
+    : Array.from(new Set([
+      ...changedKeys.filter(key => keys.includes(key)),
+      ...keys.filter(key => !nextState[key]),
+    ]));
+
+  Object.keys(nextState).forEach(key => {
+    if (!keys.includes(key)) {
+      delete nextState[key];
+    }
+  });
+
+  if (!wanted.length) {
+    if (range === rangeKey) {
+      renderAll();
+    }
+    return;
+  }
 
   try {
-    for (const keysChunk of chunk(keys, HISTORY_CHUNK_SIZE)) {
+    for (const keysChunk of chunk(wanted, HISTORY_CHUNK_SIZE)) {
       const query = new URLSearchParams({
         view: 'history',
         range,
@@ -404,43 +511,60 @@ async function syncRangeHistory(range) {
   }
 
   historyStore[range] = nextState;
+  historyStamp[range] = lastRefreshedAt;
   if (range === rangeKey) {
     renderAll();
   }
 }
 
-function fetchStatus() {
+function fetchStatus(force = false) {
   if (fetching) return;
   fetching = true;
 
-  return requestJSON(`${API_URL}?view=summary`)
+  const params = new URLSearchParams({ view: 'summary' });
+  if (!force && lastRefreshedAt) {
+    params.set('since', String(lastRefreshedAt));
+  }
+
+  return requestJSON(`${API_URL}?${params.toString()}`)
     .then(response => {
+      if (response.status === 304) {
+        INTERVAL = NO_UPDATE_INTERVAL;
+        countdown = INTERVAL;
+        saveNextCheck(INTERVAL);
+        return null;
+      }
       if (!response.ok) {
         throw new Error(`HTTP ${response.status}`);
       }
       return response.json();
     })
     .then(payload => {
+      if (payload == null) {
+        return syncRangeHistory(rangeKey);
+      }
       if (!payload || !Array.isArray(payload.s)) {
         throw new Error('summary 数据格式异常');
       }
 
-      INTERVAL = payload.i || 120;
+      INTERVAL = UPDATED_INTERVAL;
       const nextRefreshedAt = payload.t || 0;
-      const elapsed = Math.floor(Date.now() / 1000) - nextRefreshedAt;
-      countdown = Math.max(5, INTERVAL - elapsed);
-      allData = payload.s.map(decodeSummaryRow);
+      countdown = INTERVAL;
+      const nextData = payload.s.map(decodeSummaryRow);
+      const changedKeys = diffChangedKeys(allData, nextData);
+      const forceAll = nextRefreshedAt !== lastRefreshedAt;
 
-      if (nextRefreshedAt !== lastRefreshedAt) {
-        resetHistoryStore();
-      }
+      allData = nextData;
       lastRefreshedAt = nextRefreshedAt;
+      saveLocalCache(SUMMARY_CACHE_KEY, payload);
+      saveNextCheck(INTERVAL);
 
       renderAll();
-      return syncRangeHistory(rangeKey);
+      return syncRangeHistory(rangeKey, changedKeys, forceAll);
     })
     .catch(() => {
-      countdown = INTERVAL;
+      countdown = Math.max(INTERVAL, NO_UPDATE_INTERVAL);
+      saveNextCheck(NO_UPDATE_INTERVAL);
       document.getElementById('summaryText').textContent = '获取失败';
     })
     .finally(() => {
@@ -458,4 +582,12 @@ setInterval(() => {
 
 document.getElementById('ovPeriod').textContent = RANGE_LABEL[rangeKey];
 document.getElementById('fyear').textContent = new Date().getFullYear();
-fetchStatus();
+
+const hasSummaryCache = hydrateSummaryCache();
+const hasNextCheckCache = hydrateNextCheck();
+if (hasSummaryCache) {
+  syncRangeHistory(rangeKey);
+}
+if (!hasSummaryCache || !hasNextCheckCache) {
+  fetchStatus();
+}
