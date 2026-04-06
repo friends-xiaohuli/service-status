@@ -1,6 +1,7 @@
 package main
 
 import (
+	"compress/gzip"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
@@ -41,12 +42,14 @@ type ServiceConfig struct {
 	Token    string `json:"token,omitempty"`
 	Insecure bool   `json:"insecure"`          // true = 跳过 TLS 证书校验（自签名/过期证书）
 	Display  *bool  `json:"display,omitempty"` // nil/true = 展示，false = 隐藏
+	Enable   *bool  `json:"enable,omitempty"`  // nil/true = 启用检测，false = 停用且不记录
 }
 
 type ServiceGroupConfig struct {
 	Name        string          `json:"name"`
 	Description string          `json:"description,omitempty"`
 	Display     *bool           `json:"display,omitempty"` // nil/true = 展示，false = 隐藏
+	Enable      *bool           `json:"enable,omitempty"`  // nil/true = 启用组内检测，false = 停用且不记录
 	Services    []ServiceConfig `json:"services"`
 }
 
@@ -62,6 +65,7 @@ type Config struct {
 // ========== 状态结构 ==========
 
 type ServiceStatus struct {
+	Key          string         `json:"key,omitempty"`
 	Name         string         `json:"name"`
 	Subtitle     string         `json:"subtitle,omitempty"`
 	Type         string         `json:"type"`
@@ -72,7 +76,11 @@ type ServiceStatus struct {
 	CheckedAt    string         `json:"checked_at"`
 	Uptime       float64        `json:"uptime"`
 	CheckCount   int            `json:"check_count"`
-	History      []HistoryEntry `json:"history"`
+	Visible      bool           `json:"visible"`
+	Uptime24BP   int            `json:"uptime_24_bp,omitempty"`
+	Uptime7dBP   int            `json:"uptime_7d_bp,omitempty"`
+	Uptime30dBP  int            `json:"uptime_30d_bp,omitempty"`
+	History      []HistoryEntry `json:"history,omitempty"`
 }
 
 // ========== 可用率 & 历史追踪 ==========
@@ -148,6 +156,21 @@ type APIResponse struct {
 	RefreshedAt int64           `json:"refreshed_at"` // Unix 时间戳（秒）
 	Interval    int             `json:"interval"`     // 刷新间隔（秒）
 	Services    []ServiceStatus `json:"services"`
+}
+
+type compactSummaryResponse struct {
+	V int     `json:"v"`
+	T int64   `json:"t"`
+	I int     `json:"i"`
+	S [][]any `json:"s,omitempty"`
+}
+
+type compactHistoryResponse struct {
+	V int     `json:"v"`
+	T int64   `json:"t"`
+	R string  `json:"r"`
+	S int     `json:"s"`
+	H [][]any `json:"h,omitempty"`
 }
 
 var (
@@ -301,38 +324,44 @@ func normalizeConfig(raw Config) Config {
 		TLSKey:    raw.TLSKey,
 	}
 
-	appendService := func(groupName string, svc ServiceConfig) {
-		if !isDisplayEnabled(svc.Display) {
+	appendService := func(groupName string, groupDisplay *bool, svc ServiceConfig) {
+		if !isEnabled(svc.Enable) {
 			return
 		}
 		svc.Group = strings.TrimSpace(svc.Group)
 		if svc.Group == "" {
 			svc.Group = strings.TrimSpace(groupName)
 		}
+		visible := isDisplayEnabled(groupDisplay) && isDisplayEnabled(svc.Display)
+		svc.Display = boolPtr(visible)
 		cfg.Services = append(cfg.Services, svc)
 	}
 
 	for _, svc := range raw.Services {
-		appendService("", svc)
+		appendService("", nil, svc)
 	}
 	for _, group := range raw.ServiceGroups {
-		if !isDisplayEnabled(group.Display) {
+		if !isEnabled(group.Enable) {
 			continue
 		}
 
+		groupVisible := isDisplayEnabled(group.Display)
 		visibleGroup := ServiceGroupConfig{
 			Name:        group.Name,
 			Description: group.Description,
-			Display:     group.Display,
+			Display:     boolPtr(groupVisible),
+			Enable:      group.Enable,
 		}
 		for _, svc := range group.Services {
-			if !isDisplayEnabled(svc.Display) {
+			if !isEnabled(svc.Enable) {
 				continue
 			}
-			visibleGroup.Services = append(visibleGroup.Services, svc)
-			appendService(group.Name, svc)
+			appendService(group.Name, group.Display, svc)
+			if groupVisible && isDisplayEnabled(svc.Display) {
+				visibleGroup.Services = append(visibleGroup.Services, svc)
+			}
 		}
-		if len(visibleGroup.Services) > 0 {
+		if groupVisible && len(visibleGroup.Services) > 0 {
 			cfg.ServiceGroups = append(cfg.ServiceGroups, visibleGroup)
 		}
 	}
@@ -342,6 +371,14 @@ func normalizeConfig(raw Config) Config {
 
 func isDisplayEnabled(display *bool) bool {
 	return display == nil || *display
+}
+
+func isEnabled(enable *bool) bool {
+	return enable == nil || *enable
+}
+
+func boolPtr(v bool) *bool {
+	return &v
 }
 
 func setConfig(cfg Config) {
@@ -362,6 +399,15 @@ func getServicesSnapshot() []ServiceConfig {
 	services := make([]ServiceConfig, len(config.Services))
 	copy(services, config.Services)
 	return services
+}
+
+func getServiceMap() map[string]ServiceConfig {
+	services := getServicesSnapshot()
+	result := make(map[string]ServiceConfig, len(services))
+	for _, svc := range services {
+		result[serviceKey(svc)] = svc
+	}
+	return result
 }
 
 func watchConfig(path string) {
@@ -1015,16 +1061,21 @@ func refreshAllStatus() {
 
 	for _, observation := range observations {
 		r := observation.state
+		r.Key = observation.key
 		r.Group = observation.cfg.Group
 		r.Subtitle = observation.cfg.Subtitle
+		r.Visible = isDisplayEnabled(observation.cfg.Display)
 		memHistory, memUptime, memCount := getHistory(observation.key).snapshot()
 		r.Uptime = memUptime
 		r.CheckCount = memCount
+		statsHistory := memHistory
 		if history, ok := historiesByKey[observation.key]; ok && len(history) > 0 {
-			r.History = history
-		} else {
-			r.History = memHistory
+			statsHistory = history
 		}
+		nowUnix := time.Now().Unix()
+		r.Uptime24BP = uptimeBasisPointsSince(statsHistory, nowUnix-int64(24*time.Hour/time.Second))
+		r.Uptime7dBP = uptimeBasisPointsSince(statsHistory, nowUnix-int64(7*24*time.Hour/time.Second))
+		r.Uptime30dBP = uptimeBasisPointsSince(statsHistory, nowUnix-int64(30*24*time.Hour/time.Second))
 		results[observation.index] = r
 	}
 
@@ -1035,17 +1086,382 @@ func refreshAllStatus() {
 	log.Printf("[刷新] 已检测 %d 个服务", len(results))
 }
 
-func apiStatusHandler(w http.ResponseWriter, r *http.Request) {
-	statusLock.RLock()
-	resp := APIResponse{
-		RefreshedAt: lastRefreshed,
-		Interval:    int(refreshInterval / time.Second),
-		Services:    lastStatus,
+func uptimeBasisPointsSince(entries []HistoryEntry, since int64) int {
+	total := 0
+	success := 0
+	for _, entry := range entries {
+		if entry.Ts < since {
+			continue
+		}
+		total++
+		if entry.Status == "online" {
+			success++
+		}
 	}
-	statusLock.RUnlock()
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	json.NewEncoder(w).Encode(resp)
+	if total == 0 {
+		return -1
+	}
+	return success * 10000 / total
+}
+
+func parseSince(query string) int64 {
+	since, err := strconv.ParseInt(strings.TrimSpace(query), 10, 64)
+	if err != nil || since < 0 {
+		return 0
+	}
+	return since
+}
+
+func parseRangeWindow(query string) (string, time.Duration) {
+	switch strings.TrimSpace(strings.ToLower(query)) {
+	case "7d":
+		return "7d", 7 * 24 * time.Hour
+	case "30d":
+		return "30d", 30 * 24 * time.Hour
+	default:
+		return "24h", 24 * time.Hour
+	}
+}
+
+func parseSlots(query string, fallback int) int {
+	slots, err := strconv.Atoi(strings.TrimSpace(query))
+	if err != nil || slots <= 0 {
+		return fallback
+	}
+	if slots < 10 {
+		return 10
+	}
+	if slots > 120 {
+		return 120
+	}
+	return slots
+}
+
+func parseKeys(r *http.Request) []string {
+	var keys []string
+	for _, raw := range r.URL.Query()["keys"] {
+		for _, part := range strings.Split(raw, ",") {
+			key := strings.TrimSpace(part)
+			if key == "" {
+				continue
+			}
+			keys = append(keys, key)
+		}
+	}
+	if len(keys) > 64 {
+		keys = keys[:64]
+	}
+	return dedupeStrings(keys)
+}
+
+func encodeStatus(status string) int {
+	switch status {
+	case "online":
+		return 0
+	case "offline":
+		return 1
+	default:
+		return 2
+	}
+}
+
+func encodeType(kind string) int {
+	switch kind {
+	case "http":
+		return 0
+	case "tcp":
+		return 1
+	case "ping":
+		return 2
+	case "mysql":
+		return 3
+	case "napcat_qq":
+		return 4
+	default:
+		return 9
+	}
+}
+
+func snapshotStatuses(includeHidden bool) ([]ServiceStatus, int64) {
+	statusLock.RLock()
+	defer statusLock.RUnlock()
+
+	result := make([]ServiceStatus, 0, len(lastStatus))
+	for _, svc := range lastStatus {
+		if !includeHidden && !svc.Visible {
+			continue
+		}
+		copySvc := svc
+		copySvc.History = nil
+		result = append(result, copySvc)
+	}
+	return result, lastRefreshed
+}
+
+func statusETag(refreshedAt int64) string {
+	return fmt.Sprintf("W/\"status-%d\"", refreshedAt)
+}
+
+func clientHasFreshStatus(r *http.Request, refreshedAt int64) bool {
+	if refreshedAt <= 0 {
+		return false
+	}
+	if since := parseSince(r.URL.Query().Get("since")); since >= refreshedAt {
+		return true
+	}
+	if match := strings.TrimSpace(r.Header.Get("If-None-Match")); match != "" && match == statusETag(refreshedAt) {
+		return true
+	}
+	return false
+}
+
+func sampleHistoryEntries(entries []HistoryEntry, since int64, slots int) []HistoryEntry {
+	filtered := make([]HistoryEntry, 0, len(entries))
+	for _, entry := range entries {
+		if entry.Ts >= since {
+			filtered = append(filtered, entry)
+		}
+	}
+	if len(filtered) <= slots {
+		return filtered
+	}
+
+	step := float64(len(filtered)) / float64(slots)
+	sampled := make([]HistoryEntry, 0, slots)
+	for i := 0; i < slots; i++ {
+		index := int(float64(i) * step)
+		if index >= len(filtered) {
+			index = len(filtered) - 1
+		}
+		sampled = append(sampled, filtered[index])
+	}
+	return sampled
+}
+
+func loadHistoryWindowForServices(services []ServiceConfig, since time.Time) (map[string][]HistoryEntry, error) {
+	result := make(map[string][]HistoryEntry, len(services))
+	if len(services) == 0 {
+		return result, nil
+	}
+
+	if historyDB != nil {
+		entriesByKey, err := loadPersistedHistories(services, since)
+		if err != nil {
+			return nil, err
+		}
+		for _, svc := range services {
+			key := serviceKey(svc)
+			if entries, ok := entriesByKey[key]; ok && len(entries) > 0 {
+				result[key] = entries
+				continue
+			}
+			memEntries, _, _ := getHistory(key).snapshot()
+			result[key] = sampleHistoryEntries(memEntries, since.Unix(), len(memEntries))
+		}
+		return result, nil
+	}
+
+	for _, svc := range services {
+		key := serviceKey(svc)
+		memEntries, _, _ := getHistory(key).snapshot()
+		result[key] = sampleHistoryEntries(memEntries, since.Unix(), len(memEntries))
+	}
+	return result, nil
+}
+
+const allowedStatusAPIOrigin = "https://static.0201799.xyz"
+
+func requestScheme(r *http.Request) string {
+	if forwarded := strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")); forwarded != "" {
+		parts := strings.Split(forwarded, ",")
+		if len(parts) > 0 {
+			proto := strings.ToLower(strings.TrimSpace(parts[0]))
+			if proto != "" {
+				return proto
+			}
+		}
+	}
+	if r.TLS != nil {
+		return "https"
+	}
+	return "http"
+}
+
+func currentRequestOrigin(r *http.Request) string {
+	return requestScheme(r) + "://" + r.Host
+}
+
+func isAllowedStatusOrigin(r *http.Request) bool {
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
+		return true
+	}
+	return strings.EqualFold(origin, allowedStatusAPIOrigin) || strings.EqualFold(origin, currentRequestOrigin(r))
+}
+
+func applyStatusCORS(headers http.Header, r *http.Request) {
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if strings.EqualFold(origin, allowedStatusAPIOrigin) {
+		headers.Set("Access-Control-Allow-Origin", allowedStatusAPIOrigin)
+	}
+}
+
+func writeJSON(w http.ResponseWriter, r *http.Request, status int, payload any, cacheControl string, etag string) {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		http.Error(w, "json encode failed", http.StatusInternalServerError)
+		return
+	}
+
+	headers := w.Header()
+	headers.Set("Content-Type", "application/json; charset=utf-8")
+	applyStatusCORS(headers, r)
+	headers.Set("Cache-Control", cacheControl)
+	headers.Set("Vary", "Origin, Accept-Encoding, If-None-Match")
+	if etag != "" {
+		headers.Set("ETag", etag)
+	}
+
+	if strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") && len(body) >= 256 {
+		headers.Set("Content-Encoding", "gzip")
+		w.WriteHeader(status)
+		gz := gzip.NewWriter(w)
+		defer gz.Close()
+		_, _ = gz.Write(body)
+		return
+	}
+
+	w.WriteHeader(status)
+	_, _ = w.Write(body)
+}
+
+func serveStatusSummary(w http.ResponseWriter, r *http.Request) {
+	includeHidden := r.URL.Query().Get("all") == "1"
+	statuses, refreshedAt := snapshotStatuses(includeHidden)
+	etag := statusETag(refreshedAt)
+	if clientHasFreshStatus(r, refreshedAt) {
+		headers := w.Header()
+		applyStatusCORS(headers, r)
+		headers.Set("Cache-Control", "public, max-age=15, stale-while-revalidate=45")
+		headers.Set("ETag", etag)
+		headers.Set("Vary", "Origin, Accept-Encoding, If-None-Match")
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+
+	rows := make([][]any, 0, len(statuses))
+	for _, svc := range statuses {
+		rows = append(rows, []any{
+			svc.Key,
+			svc.Name,
+			svc.Subtitle,
+			svc.Group,
+			encodeType(svc.Type),
+			encodeStatus(svc.Status),
+			svc.ResponseTime,
+			svc.Message,
+			svc.Uptime24BP,
+			svc.Uptime7dBP,
+			svc.Uptime30dBP,
+		})
+	}
+
+	writeJSON(w, r, http.StatusOK, compactSummaryResponse{
+		V: 2,
+		T: refreshedAt,
+		I: int(refreshInterval / time.Second),
+		S: rows,
+	}, "public, max-age=15, stale-while-revalidate=45", etag)
+}
+
+func serveStatusHistory(w http.ResponseWriter, r *http.Request) {
+	keys := parseKeys(r)
+	rangeLabel, window := parseRangeWindow(r.URL.Query().Get("range"))
+	slots := parseSlots(r.URL.Query().Get("slots"), 40)
+	_, refreshedAt := snapshotStatuses(true)
+	if len(keys) == 0 {
+		writeJSON(w, r, http.StatusOK, compactHistoryResponse{
+			V: 2,
+			T: refreshedAt,
+			R: rangeLabel,
+			S: slots,
+			H: [][]any{},
+		}, "public, max-age=15, stale-while-revalidate=45", statusETag(refreshedAt))
+		return
+	}
+	serviceMap := getServiceMap()
+	services := make([]ServiceConfig, 0, len(keys))
+	for _, key := range keys {
+		svc, ok := serviceMap[key]
+		if !ok {
+			continue
+		}
+		services = append(services, svc)
+	}
+
+	since := time.Now().Add(-window)
+	entriesByKey, err := loadHistoryWindowForServices(services, since)
+	if err != nil {
+		http.Error(w, "load history failed", http.StatusInternalServerError)
+		return
+	}
+
+	rows := make([][]any, 0, len(services))
+	for _, svc := range services {
+		key := serviceKey(svc)
+		sampled := sampleHistoryEntries(entriesByKey[key], since.Unix(), slots)
+		points := make([][]any, 0, len(sampled))
+		for _, entry := range sampled {
+			points = append(points, []any{entry.Ts, encodeStatus(entry.Status), entry.ResponseTime})
+		}
+		rows = append(rows, []any{key, points})
+	}
+
+	writeJSON(w, r, http.StatusOK, compactHistoryResponse{
+		V: 2,
+		T: refreshedAt,
+		R: rangeLabel,
+		S: slots,
+		H: rows,
+	}, "public, max-age=15, stale-while-revalidate=45", statusETag(refreshedAt))
+}
+
+func serveStatusHealth(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, r, http.StatusOK, map[string]any{
+		"status":  "ok",
+		"message": "请求正常",
+	}, "public, max-age=15, stale-while-revalidate=45", "")
+}
+
+func apiStatusHandler(w http.ResponseWriter, r *http.Request) {
+	if !isAllowedStatusOrigin(r) {
+		http.Error(w, "forbidden origin", http.StatusForbidden)
+		return
+	}
+
+	if r.Method == http.MethodOptions {
+		headers := w.Header()
+		applyStatusCORS(headers, r)
+		headers.Set("Vary", "Origin, Access-Control-Request-Method, Access-Control-Request-Headers")
+		headers.Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+		headers.Set("Access-Control-Allow-Headers", "Content-Type, If-None-Match")
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	switch strings.ToLower(strings.TrimSpace(r.URL.Query().Get("view"))) {
+	case "summary":
+		serveStatusSummary(w, r)
+	case "history":
+		serveStatusHistory(w, r)
+	default:
+		serveStatusHealth(w, r)
+	}
 }
 
 func main() {

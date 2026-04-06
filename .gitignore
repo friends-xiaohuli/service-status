@@ -1,5 +1,3 @@
-release/service-status-win-x64/config.json
-release/service-status-win-x64/service-status.exe
-release/service-status-win-x64/start.bat
-release/service-status-win-x64/web/index.html
+release
 status-history.db
+.gocache

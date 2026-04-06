@@ -19,7 +19,6 @@ mkdir "%RELEASE_DIR%\web"
 
 copy /y "%APP_NAME%.exe" "%RELEASE_DIR%\%APP_NAME%.exe" > nul
 copy /y "config.json" "%RELEASE_DIR%\config.json" > nul
-copy /y "start.bat" "%RELEASE_DIR%\start.bat" > nul
 copy /y "web\*" "%RELEASE_DIR%\web\" > nul
 
 echo.

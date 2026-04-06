@@ -30,14 +30,16 @@
           "type": "http",
           "url": "https://dnai18napi.0201799.xyz/",
           "timeout": 5,
-          "display": false
+          "display": false,
+          "Enable": false
         },
         {
           "name": "恐鬼症资讯镜像站点",
           "type": "http",
           "url": "https://www.072100000.xyz/",
           "timeout": 5,
-          "display": false
+          "display": false,
+          "Enable": false
         }
       ]
     },
@@ -83,6 +85,7 @@
     {
       "name": "测试",
       "display": false,
+      "Enable": false,
       "services": [
         {
           "name": "测试",
