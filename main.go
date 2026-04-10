@@ -1,11 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"compress/gzip"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base32"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -189,6 +191,8 @@ var (
 	historyDB     *historyStore
 	probeState    = map[string]probeRuntimeState{}
 	probeStateMu  sync.Mutex
+	napCatAuthMu  sync.Mutex
+	napCatTokens  = map[string]string{}
 )
 
 type probeRuntimeState struct {
@@ -405,6 +409,429 @@ func parseNapCatCode(payload map[string]any) (int64, bool) {
 		}
 	}
 	return 0, false
+}
+
+func parseNapCatMessage(payload map[string]any) string {
+	value, ok := payload["message"]
+	if !ok {
+		return ""
+	}
+	text, _ := value.(string)
+	return strings.TrimSpace(text)
+}
+
+func isNapCatUnauthorized(payload map[string]any) bool {
+	code, ok := parseNapCatCode(payload)
+	if !ok || code != -1 {
+		return false
+	}
+	return strings.EqualFold(parseNapCatMessage(payload), "Unauthorized")
+}
+
+type napCatSessionEnvelope struct {
+	Data struct {
+		CreatedTime int64  `json:"CreatedTime"`
+		HashEncoded string `json:"HashEncoded"`
+	} `json:"Data"`
+	Hmac string `json:"Hmac"`
+}
+
+func napCatSessionCacheKey(cfg ServiceConfig, rawToken string) string {
+	host := strings.TrimSpace(cfg.Host)
+	port := cfg.Port
+	if port == 0 {
+		port = 6099
+	}
+	return fmt.Sprintf("%s:%d|%s", host, port, rawToken)
+}
+
+func getCachedNapCatToken(key string) string {
+	napCatAuthMu.Lock()
+	defer napCatAuthMu.Unlock()
+	return napCatTokens[key]
+}
+
+func setCachedNapCatToken(key, token string) {
+	napCatAuthMu.Lock()
+	defer napCatAuthMu.Unlock()
+	if strings.TrimSpace(token) == "" {
+		delete(napCatTokens, key)
+		return
+	}
+	napCatTokens[key] = token
+}
+
+func isNapCatSessionToken(token string) bool {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return false
+	}
+
+	decoded, err := base64.StdEncoding.DecodeString(token)
+	if err != nil {
+		return false
+	}
+
+	var envelope napCatSessionEnvelope
+	if err := json.Unmarshal(decoded, &envelope); err != nil {
+		return false
+	}
+	return envelope.Data.CreatedTime > 0 &&
+		strings.TrimSpace(envelope.Data.HashEncoded) != "" &&
+		strings.TrimSpace(envelope.Hmac) != ""
+}
+
+func decodeNapCatSessionToken(token string) (napCatSessionEnvelope, bool) {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return napCatSessionEnvelope{}, false
+	}
+	decoded, err := base64.StdEncoding.DecodeString(token)
+	if err != nil {
+		return napCatSessionEnvelope{}, false
+	}
+	var envelope napCatSessionEnvelope
+	if err := json.Unmarshal(decoded, &envelope); err != nil {
+		return napCatSessionEnvelope{}, false
+	}
+	if envelope.Data.CreatedTime <= 0 || strings.TrimSpace(envelope.Data.HashEncoded) == "" || strings.TrimSpace(envelope.Hmac) == "" {
+		return napCatSessionEnvelope{}, false
+	}
+	return envelope, true
+}
+
+func sha256Hex(text string) string {
+	sum := sha256.Sum256([]byte(text))
+	return fmt.Sprintf("%x", sum[:])
+}
+
+func napCatLoginHash(token string) string {
+	return sha256Hex(strings.TrimSpace(token) + ".napcat")
+}
+
+func isHexSHA256(text string) bool {
+	text = strings.TrimSpace(text)
+	if len(text) != 64 {
+		return false
+	}
+	for _, ch := range text {
+		if (ch < '0' || ch > '9') && (ch < 'a' || ch > 'f') && (ch < 'A' || ch > 'F') {
+			return false
+		}
+	}
+	return true
+}
+
+func extractNapCatTokenValue(value any) string {
+	switch v := value.(type) {
+	case string:
+		v = strings.TrimSpace(v)
+		if isNapCatSessionToken(v) {
+			return v
+		}
+	case map[string]any:
+		for _, key := range []string{"token", "Token", "access_token", "accessToken", "authorization", "Authorization"} {
+			if token := extractNapCatTokenValue(v[key]); token != "" {
+				return token
+			}
+		}
+		for _, nested := range v {
+			if token := extractNapCatTokenValue(nested); token != "" {
+				return token
+			}
+		}
+	case []any:
+		for _, nested := range v {
+			if token := extractNapCatTokenValue(nested); token != "" {
+				return token
+			}
+		}
+	}
+	return ""
+}
+
+func sanitizeNapCatPreview(text string) string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return ""
+	}
+	text = strings.ReplaceAll(text, "\r", " ")
+	text = strings.ReplaceAll(text, "\n", " ")
+	text = strings.Join(strings.Fields(text), " ")
+	if len(text) > 240 {
+		text = text[:240] + "..."
+	}
+	return text
+}
+
+func extractNapCatTokenFromCookies(cookies []*http.Cookie) string {
+	for _, cookie := range cookies {
+		if cookie == nil {
+			continue
+		}
+		if token := extractNapCatTokenValue(cookie.Value); token != "" {
+			return token
+		}
+	}
+	return ""
+}
+
+func extractNapCatTokenFromHeaders(header http.Header) string {
+	for _, key := range []string{"Authorization", "X-Token", "Token", "Access-Token"} {
+		for _, value := range header.Values(key) {
+			value = strings.TrimSpace(value)
+			value = strings.TrimPrefix(value, "Bearer ")
+			value = strings.TrimSpace(value)
+			if token := extractNapCatTokenValue(value); token != "" {
+				return token
+			}
+		}
+	}
+	return ""
+}
+
+func extractNapCatTokenFromResponse(resp *http.Response) string {
+	if resp == nil {
+		return ""
+	}
+	if token := extractNapCatTokenFromHeaders(resp.Header); token != "" {
+		return token
+	}
+	return extractNapCatTokenFromCookies(resp.Cookies())
+}
+
+func napCatBaseURL(cfg ServiceConfig) string {
+	host := strings.TrimSpace(cfg.Host)
+	port := cfg.Port
+	if port == 0 {
+		port = 6099
+	}
+	return fmt.Sprintf("http://%s:%d", host, port)
+}
+
+func buildNapCatRequest(method, rawURL string, body io.Reader, token string) (*http.Request, error) {
+	req, err := http.NewRequest(method, rawURL, body)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json, text/plain, */*")
+	req.Header.Set("Accept-Encoding", "gzip, deflate")
+	req.Header.Set("Cache-Control", "no-cache")
+	req.Header.Set("Pragma", "no-cache")
+	req.Header.Set("User-Agent", "service-status/1.0")
+	if strings.TrimSpace(token) != "" {
+		req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(token))
+	}
+	return req, nil
+}
+
+func napCatAuthCheck(client *http.Client, cfg ServiceConfig, baseURL, token string) (bool, int, string) {
+	path := "/api/auth/check"
+	req, err := buildNapCatRequest(http.MethodPost, baseURL+path, nil, token)
+	if err != nil {
+		return false, 0, "请求创建失败"
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return false, 0, "NapCat 请求失败"
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 256))
+	_ = resp.Body.Close()
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return true, resp.StatusCode, ""
+	}
+	return false, resp.StatusCode, fmt.Sprintf("HTTP %d", resp.StatusCode)
+}
+
+func exchangeNapCatBrowserToken(client *http.Client, cfg ServiceConfig, initialToken string) (string, string, error) {
+	baseURL := napCatBaseURL(cfg)
+	type tokenCandidate struct {
+		Value string
+		Label string
+	}
+	hashCandidates := make([]tokenCandidate, 0, 4)
+	seenCandidates := map[string]struct{}{}
+	appendCandidate := func(value, label string) {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return
+		}
+		if _, ok := seenCandidates[value]; ok {
+			return
+		}
+		seenCandidates[value] = struct{}{}
+		hashCandidates = append(hashCandidates, tokenCandidate{Value: value, Label: label})
+	}
+	if isHexSHA256(initialToken) {
+		appendCandidate(initialToken, "prehashed")
+	} else {
+		appendCandidate(napCatLoginHash(initialToken), "sha256(token+.napcat)")
+	}
+	if envelope, ok := decodeNapCatSessionToken(initialToken); ok {
+		hashCandidates = hashCandidates[:0]
+		seenCandidates = map[string]struct{}{}
+		appendCandidate(envelope.Data.HashEncoded, "session.HashEncoded")
+	}
+
+	type loginAttempt struct {
+		Path  string
+		Body  map[string]string
+		Label string
+	}
+
+	attempts := make([]loginAttempt, 0, len(hashCandidates))
+	for _, candidate := range hashCandidates {
+		attempts = append(attempts, loginAttempt{
+			Path:  "/api/auth/login",
+			Body:  map[string]string{"hash": candidate.Value},
+			Label: "/api/auth/login hash=" + candidate.Label,
+		})
+	}
+	if len(attempts) == 0 {
+		return "", "", errors.New("没有可用于 /api/auth/login 的 hash 候选值")
+	}
+
+	lastMessage := "auth/login 交换失败"
+	failures := make([]string, 0, 6)
+	seenFailures := map[string]struct{}{}
+	appendFailure := func(text string) {
+		text = strings.TrimSpace(text)
+		if text == "" {
+			return
+		}
+		if _, ok := seenFailures[text]; ok {
+			return
+		}
+		seenFailures[text] = struct{}{}
+		if len(failures) < 6 {
+			failures = append(failures, text)
+		}
+		lastMessage = text
+	}
+	for _, attempt := range attempts {
+		payload, err := json.Marshal(attempt.Body)
+		if err != nil {
+			appendFailure(attempt.Label + " JSON 序列化失败")
+			continue
+		}
+		req, err := buildNapCatRequest(http.MethodPost, baseURL+attempt.Path, bytes.NewReader(payload), "")
+		if err != nil {
+			appendFailure(attempt.Label + " 请求创建失败")
+			continue
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := client.Do(req)
+		if err != nil {
+			appendFailure(attempt.Label + " NapCat 登录请求失败")
+			continue
+		}
+
+		if token := extractNapCatTokenFromResponse(resp); token != "" {
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+			_ = resp.Body.Close()
+			return token, attempt.Path, nil
+		}
+
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		_ = resp.Body.Close()
+		if readErr != nil {
+			appendFailure(attempt.Label + " NapCat 登录响应读取失败")
+			continue
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			appendFailure(fmt.Sprintf("%s HTTP %d: %s", attempt.Label, resp.StatusCode, sanitizeNapCatPreview(string(body))))
+			continue
+		}
+
+		trimmed := strings.TrimSpace(string(body))
+		if isNapCatSessionToken(trimmed) {
+			return trimmed, attempt.Path, nil
+		}
+
+		var parsed any
+		if err := json.Unmarshal(body, &parsed); err == nil {
+			if token := extractNapCatTokenValue(parsed); token != "" {
+				return token, attempt.Path, nil
+			}
+		}
+		appendFailure(fmt.Sprintf("%s 2xx 但未返回会话 token: %s", attempt.Label, sanitizeNapCatPreview(trimmed)))
+	}
+
+	if len(failures) > 0 {
+		return "", "", errors.New(strings.Join(failures, " | "))
+	}
+	return "", "", errors.New(lastMessage)
+}
+
+func resolveNapCatAuthToken(client *http.Client, cfg ServiceConfig) (string, string, error) {
+	rawToken := strings.TrimSpace(cfg.Token)
+	if rawToken == "" {
+		return "", "", errors.New("缺少 NapCat token")
+	}
+	if isNapCatSessionToken(rawToken) {
+		return rawToken, "session", nil
+	}
+
+	cacheKey := napCatSessionCacheKey(cfg, rawToken)
+	if cached := strings.TrimSpace(getCachedNapCatToken(cacheKey)); cached != "" {
+		if ok, _, _ := napCatAuthCheck(client, cfg, napCatBaseURL(cfg), cached); ok {
+			return cached, "cached-login", nil
+		}
+		setCachedNapCatToken(cacheKey, "")
+	}
+
+	token, _, err := exchangeNapCatBrowserToken(client, cfg, rawToken)
+	if err != nil {
+		return "", "", err
+	}
+	setCachedNapCatToken(cacheKey, token)
+	return token, "login", nil
+}
+
+func retryNapCatAuthToken(client *http.Client, cfg ServiceConfig, tokenSource string) (string, string, error) {
+	rawToken := strings.TrimSpace(cfg.Token)
+	cacheKey := napCatSessionCacheKey(cfg, rawToken)
+
+	if tokenSource == "cached-login" {
+		setCachedNapCatToken(cacheKey, "")
+		return resolveNapCatAuthToken(client, cfg)
+	}
+
+	if isNapCatSessionToken(rawToken) {
+		token, _, err := exchangeNapCatBrowserToken(client, cfg, rawToken)
+		if err != nil {
+			return "", "", err
+		}
+		setCachedNapCatToken(cacheKey, token)
+		return token, "session-refresh", nil
+	}
+
+	token, _, err := exchangeNapCatBrowserToken(client, cfg, rawToken)
+	if err != nil {
+		return "", "", err
+	}
+	setCachedNapCatToken(cacheKey, token)
+	return token, "login-retry", nil
+}
+
+func fetchNapCatStatus(client *http.Client, cfg ServiceConfig, authToken string) (*http.Response, int64, error) {
+	host := strings.TrimSpace(cfg.Host)
+	port := cfg.Port
+	if port == 0 {
+		port = 6099
+	}
+	statusEndpoint := fmt.Sprintf("http://%s:%d/api/Plugin/ext/napcat-plugin-builtin/status", host, port)
+
+	req, err := buildNapCatRequest(http.MethodGet, statusEndpoint, nil, authToken)
+	if err != nil {
+		return nil, 0, err
+	}
+	req.Header.Set("Referer", fmt.Sprintf("http://%s:%d/plugin/napcat-plugin-builtin/page/dashboard", host, port))
+
+	start := time.Now()
+	resp, err := client.Do(req)
+	return resp, time.Since(start).Milliseconds(), err
 }
 
 func loadConfigFile(path string) (Config, error) {
@@ -902,79 +1329,128 @@ func checkNapCatQQ(cfg ServiceConfig) ServiceStatus {
 		port = 6099
 	}
 
-	statusEndpoint := fmt.Sprintf("http://%s:%d/api/Plugin/ext/napcat-plugin-builtin/status", host, port)
 	client := httpClientForConfig(cfg)
-
-	req, err := http.NewRequest(http.MethodGet, statusEndpoint, nil)
+	authToken, tokenSource, err := resolveNapCatAuthToken(client, cfg)
 	if err != nil {
-		s.Status = "offline"
-		s.Message = "请求创建失败"
+		s.Status = "unknown"
+		s.Message = err.Error()
 		return s
 	}
-	req.Header.Set("Accept", "*/*")
-	req.Header.Set("Accept-Encoding", "gzip, deflate")
-	req.Header.Set("Cache-Control", "no-cache")
-	req.Header.Set("Pragma", "no-cache")
-	req.Header.Set("Referer", fmt.Sprintf("http://%s:%d/plugin/napcat-plugin-builtin/page/dashboard", host, port))
-	if token := strings.TrimSpace(cfg.Token); token != "" {
-		req.Header.Set("Authorization", fmt.Sprintf("Bearer %q", token))
-	}
 
-	start := time.Now()
-	resp, err := client.Do(req)
-	s.ResponseTime = time.Since(start).Milliseconds()
-	if err != nil {
-		s.Status = "offline"
-		s.Message = "NapCat 请求失败"
-		return s
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		if resp.StatusCode >= 400 && resp.StatusCode < 500 {
-			s.Status = "unknown"
-		} else {
-			s.Status = "offline"
+	if ok, statusCode, msg := napCatAuthCheck(client, cfg, napCatBaseURL(cfg), authToken); !ok {
+		cacheKey := napCatSessionCacheKey(cfg, strings.TrimSpace(cfg.Token))
+		if tokenSource == "cached-login" {
+			setCachedNapCatToken(cacheKey, "")
+			if refreshed, refreshedSource, refreshErr := resolveNapCatAuthToken(client, cfg); refreshErr == nil {
+				authToken = refreshed
+				tokenSource = refreshedSource
+				ok, statusCode, msg = napCatAuthCheck(client, cfg, napCatBaseURL(cfg), authToken)
+			}
 		}
-		s.Message = fmt.Sprintf("HTTP %d", resp.StatusCode)
-		return s
+		if !ok && tokenSource == "session" {
+			if refreshed, _, refreshErr := exchangeNapCatBrowserToken(client, cfg, strings.TrimSpace(cfg.Token)); refreshErr == nil {
+				authToken = refreshed
+				tokenSource = "session-refresh"
+				ok, statusCode, msg = napCatAuthCheck(client, cfg, napCatBaseURL(cfg), authToken)
+			}
+		}
+		if !ok {
+			if statusCode >= 500 || statusCode == 0 {
+				s.Status = "offline"
+			} else {
+				s.Status = "unknown"
+			}
+			if strings.TrimSpace(msg) == "" {
+				msg = fmt.Sprintf("HTTP %d", statusCode)
+			}
+			s.Message = "WebUI 鉴权失败: " + msg
+			return s
+		}
 	}
 
-	var payload map[string]any
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 512)).Decode(&payload); err != nil {
-		s.Status = "offline"
-		s.Message = "NapCat 响应解析失败"
-		return s
-	}
+	needRetry := false
+	for attempt := 0; attempt < 2; attempt++ {
+		resp, elapsed, err := fetchNapCatStatus(client, cfg, authToken)
+		s.ResponseTime = elapsed
+		if err != nil {
+			s.Status = "offline"
+			s.Message = "NapCat 请求失败"
+			return s
+		}
 
-	uptimeText := strings.TrimSpace(parseNapCatUptimeFormatted(payload))
-	if code, ok := parseNapCatCode(payload); ok {
-		switch code {
-		case -1:
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			_ = resp.Body.Close()
+			if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+				s.Status = "unknown"
+			} else {
+				s.Status = "offline"
+			}
+			s.Message = fmt.Sprintf("HTTP %d", resp.StatusCode)
+			return s
+		}
+
+		var payload map[string]any
+		if err := json.NewDecoder(io.LimitReader(resp.Body, 512)).Decode(&payload); err != nil {
+			_ = resp.Body.Close()
+			s.Status = "offline"
+			s.Message = "NapCat 响应解析失败"
+			return s
+		}
+		_ = resp.Body.Close()
+
+		if isNapCatUnauthorized(payload) {
+			if attempt == 0 {
+				refreshedToken, refreshedSource, refreshErr := retryNapCatAuthToken(client, cfg, tokenSource)
+				if refreshErr == nil {
+					authToken = refreshedToken
+					tokenSource = refreshedSource
+					needRetry = true
+					continue
+				}
+			}
 			s.Status = "unknown"
 			s.Message = fmt.Sprintf("HTTP %d · code = -1", resp.StatusCode)
 			return s
-		case 0:
-			s.Status = "online"
-			if uptimeText != "" {
-				s.Message = fmt.Sprintf("HTTP %d · %s", resp.StatusCode, uptimeText)
-			} else {
-				s.Message = fmt.Sprintf("HTTP %d · code = 0", resp.StatusCode)
-			}
-			return s
-		default:
-			s.Status = "unknown"
-			s.Message = fmt.Sprintf("HTTP %d · code = %d", resp.StatusCode, code)
-			return s
 		}
+
+		uptimeText := strings.TrimSpace(parseNapCatUptimeFormatted(payload))
+		if code, ok := parseNapCatCode(payload); ok {
+			switch code {
+			case -1:
+				if needRetry || attempt > 0 {
+					s.Status = "unknown"
+					s.Message = fmt.Sprintf("HTTP %d · code = -1", resp.StatusCode)
+					return s
+				}
+				s.Status = "unknown"
+				s.Message = fmt.Sprintf("HTTP %d · code = -1", resp.StatusCode)
+				return s
+			case 0:
+				s.Status = "online"
+				if uptimeText != "" {
+					s.Message = fmt.Sprintf("HTTP %d · %s", resp.StatusCode, uptimeText)
+				} else {
+					s.Message = fmt.Sprintf("HTTP %d", resp.StatusCode)
+				}
+				return s
+			default:
+				s.Status = "unknown"
+				s.Message = fmt.Sprintf("HTTP %d · code = %d", resp.StatusCode, code)
+				return s
+			}
+		}
+
+		s.Status = "online"
+		if uptimeText != "" {
+			s.Message = fmt.Sprintf("HTTP %d · %s", resp.StatusCode, uptimeText)
+		} else {
+			s.Message = fmt.Sprintf("HTTP %d", resp.StatusCode)
+		}
+		return s
 	}
 
-	s.Status = "online"
-	if uptimeText != "" {
-		s.Message = fmt.Sprintf("HTTP %d · %s", resp.StatusCode, uptimeText)
-	} else {
-		s.Message = fmt.Sprintf("HTTP %d", resp.StatusCode)
-	}
+	s.Status = "unknown"
+	s.Message = "HTTP 200 · code = -1"
 	return s
 }
 
@@ -1469,18 +1945,43 @@ func currentRequestOrigin(r *http.Request) string {
 	return requestScheme(r) + "://" + r.Host
 }
 
-func isAllowedStatusOrigin(r *http.Request) bool {
-	origin := strings.TrimSpace(r.Header.Get("Origin"))
-	if origin == "" {
-		return true
+func isLoopbackOrigin(origin string) bool {
+	if strings.TrimSpace(origin) == "" {
+		return false
 	}
-	return strings.EqualFold(origin, allowedStatusAPIOrigin) || strings.EqualFold(origin, currentRequestOrigin(r))
+	u, err := neturl.Parse(origin)
+	if err != nil {
+		return false
+	}
+	host := strings.TrimSpace(strings.ToLower(u.Hostname()))
+	return host == "localhost" || host == "127.0.0.1" || host == "::1"
+}
+
+func allowedStatusOriginValue(r *http.Request) string {
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	switch {
+	case origin == "":
+		return ""
+	case strings.EqualFold(origin, "null"):
+		return "null"
+	case strings.EqualFold(origin, allowedStatusAPIOrigin):
+		return allowedStatusAPIOrigin
+	case strings.EqualFold(origin, currentRequestOrigin(r)):
+		return origin
+	case isLoopbackOrigin(origin):
+		return origin
+	default:
+		return ""
+	}
+}
+
+func isAllowedStatusOrigin(r *http.Request) bool {
+	return allowedStatusOriginValue(r) != "" || strings.TrimSpace(r.Header.Get("Origin")) == ""
 }
 
 func applyStatusCORS(headers http.Header, r *http.Request) {
-	origin := strings.TrimSpace(r.Header.Get("Origin"))
-	if strings.EqualFold(origin, allowedStatusAPIOrigin) {
-		headers.Set("Access-Control-Allow-Origin", allowedStatusAPIOrigin)
+	if allowedOrigin := allowedStatusOriginValue(r); allowedOrigin != "" {
+		headers.Set("Access-Control-Allow-Origin", allowedOrigin)
 	}
 }
 

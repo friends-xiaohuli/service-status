@@ -11,6 +11,8 @@
 
 - 在本机先启动 Go 后端，默认地址通常为 `http://127.0.0.1:8080/api/status`
 - 在 Vercel 本地开发或本地模拟时，将 `STATUS_API_URL` 设为 `http://127.0.0.1:8080/api/status`
+- 如果直接双击打开 `index.html`，前端会默认请求 `http://127.0.0.1:8080/api/status`
+- 也可以通过地址参数覆盖，例如：`index.html?api=http://127.0.0.1:8080/api/status`
 
 线上部署建议：
 
